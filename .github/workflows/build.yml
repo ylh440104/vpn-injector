@@ -17,6 +17,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
       - name: Install SDK packages
         run: |
           SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
@@ -33,15 +38,15 @@ jobs:
           cat local.properties
 
       - name: Build debug APK
-        run: |
-          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          if [ -z "$SDK" ]; then SDK=/usr/local/lib/android/sdk; fi
-          export ANDROID_HOME="$SDK"
-          export ANDROID_SDK_ROOT="$SDK"
-          gradle assembleDebug --no-daemon --stacktrace
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: gradle assembleDebug --no-daemon --stacktrace --info
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: inj-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
