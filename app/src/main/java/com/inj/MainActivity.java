@@ -92,5 +92,17 @@ public class MainActivity extends Activity {
         String probe = nativeCheck();
         Log.i(TAG, probe);
         status.setText("service started\n" + probe);
+
+        // Also drop the result where a shell can read it. The log ring buffer
+        // on this device is short enough that a probe logged at startup is gone
+        // by the time anyone looks, and a silent failure here would be
+        // indistinguishable from the probe never running.
+        try {
+            java.io.FileOutputStream f = new java.io.FileOutputStream(
+                    new java.io.File(getFilesDir(), "nativecheck.txt"));
+            f.write(probe.getBytes("UTF-8"));
+            f.close();
+        } catch (Exception ignored) {
+        }
     }
 }
