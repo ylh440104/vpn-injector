@@ -286,7 +286,24 @@ public class InjService extends VpnService {
 
         try {
             int port = 47300 + (int) (System.currentTimeMillis() % 200);
-            sb.append("tun: ").append(Native.makeListener(TUN_ADDRESS, port)).append('\n');
+            int[] made = Native.makeListener(TUN_ADDRESS, port);
+            if (made != null && made[0] >= 0) {
+                sb.append("tun: fd=").append(made[0]).append(" ").append(TUN_ADDRESS)
+                        .append(':').append(port).append('\n');
+
+                // Put the options object on this listener. Any TCP child it
+                // grows inherits this via ireq->ireq_opt, which is the object
+                // the double free is about.
+                int rc = Native.applyOptions(made[0], 0x51525354);
+                sb.append("applyOptions: ").append(rc).append('\n');
+
+                if (rc == 0) {
+                    sb.append("readback: ").append(Native.readOptions(made[0])).append('\n');
+                }
+            } else {
+                sb.append("tun: failed errno=")
+                        .append(made == null ? -1 : made[1]).append('\n');
+            }
         } catch (Throwable t) {
             sb.append("tun error: ").append(t).append('\n');
         }
