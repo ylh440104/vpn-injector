@@ -12,6 +12,13 @@ android {
         targetSdk 34
         versionCode 1
         versionName '1.0'
+
+        // The device is aarch64 only, and the native helpers talk to kernels
+        // through raw syscalls, so there is nothing to gain from shipping a
+        // 32 bit build.
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
     }
 
     buildTypes {
@@ -37,10 +44,4 @@ android {
     }
 
     ndkVersion '26.1.10909125'
-
-    defaultConfig {
-        ndk {
-            abiFilters 'arm64-v8a'
-        }
-    }
 }
