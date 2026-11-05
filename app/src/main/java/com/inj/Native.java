@@ -26,12 +26,12 @@ public final class Native {
     /**
      * Create a listening socket on addr:port.
      *
-     * Returns "OK fd=N addr:port" on success, or a string naming the syscall
-     * that failed together with its errno. The address is explicit because the
-     * tun endpoint only exists inside the VPN, and a wrong guess has to be
-     * distinguishable from a port conflict.
+     * Returns {fd, 0} on success, or {-1, errno} on failure. The raw fd comes
+     * back because the caller has to setsockopt(IP_OPTIONS) on it: the whole
+     * bug hangs off the options object that a TCP child inherits from its
+     * listener, and java.net.ServerSocket cannot carry options at all.
      */
-    public static native String makeListener(String addr, int port);
+    public static native int[] makeListener(String addr, int port);
 
     /** UDP socket carrying its own options object, as a control case. */
     public static native int[] makeUdp(int tag);
