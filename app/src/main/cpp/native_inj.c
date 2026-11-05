@@ -432,11 +432,28 @@ struct race_state {
 
     unsigned char buf[RACE_MAX][256] __attribute__((aligned(64)));
     int buflen[RACE_MAX];
+
+    // Timestamp taken immediately before each writer calls write(), and the
+    // spread of one round: max - min. If this comes out in the microseconds,
+    // the window inside tcp_v4_syn_recv_sock can never be hit no matter how the
+    // rest of the test is arranged, and the honest answer is to stop chasing it.
+    uint64_t fire_ns[RACE_MAX];
 };
+
+static volatile uint64_t g_last_spread;
+static volatile uint64_t g_min_spread = ~0ULL;
+static volatile uint64_t g_max_spread;
 
 static struct race_state g_race;
 static pthread_t g_race_threads[RACE_MAX];
 static int g_race_started;
+
+static inline uint64_t race_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static void *race_thread(void *arg)
 {
@@ -460,9 +477,11 @@ static void *race_thread(void *arg)
         int idx = slot;
         int n = g_race.buflen[idx];
         if (n > 0) {
-            // Straight to the tun. No buffering layer, no allocation, no lock:
-            // this call is the last step before tun_get_user runs the receive
-            // path on this very cpu.
+            // Stamped as late as possible: this is the moment the thread entered
+            // the syscall, which is what decides whether it can overlap another
+            // cpu's copy of the same segment.
+            g_race.fire_ns[idx] = race_now_ns();
+
             ssize_t rc = write(g_race.fd, g_race.buf[idx], (size_t)n);
             (void)rc;
         }
@@ -556,7 +575,58 @@ Java_com_inj_Native_raceFire(JNIEnv *env, jclass cls, jbyteArray a, jbyteArray b
         }
     }
 
+    // How far apart the writers actually were. This is the number that decides
+    // whether the race is reachable at all, so it is measured rather than
+    // assumed.
+    {
+        uint64_t lo = ~0ULL;
+        uint64_t hi = 0;
+        int i;
+        for (i = 0; i < g_race.count; i++) {
+            uint64_t t = g_race.fire_ns[i];
+            if (t == 0) {
+                continue;
+            }
+            if (t < lo) {
+                lo = t;
+            }
+            if (t > hi) {
+                hi = t;
+            }
+        }
+        if (hi > lo) {
+            uint64_t spread = hi - lo;
+            g_last_spread = spread;
+            if (spread < g_min_spread) {
+                g_min_spread = spread;
+            }
+            if (spread > g_max_spread) {
+                g_max_spread = spread;
+            }
+        }
+    }
+
     return g_race.count;
+}
+
+// Last, smallest and largest observed spread between the first and last writer
+// entering write(), in nanoseconds.
+JNIEXPORT jlongArray JNICALL
+Java_com_inj_Native_raceSpread(JNIEnv *env, jclass cls)
+{
+    jlong out[3];
+
+    (void)cls;
+
+    out[0] = (jlong)g_last_spread;
+    out[1] = (g_min_spread == ~0ULL) ? -1 : (jlong)g_min_spread;
+    out[2] = (jlong)g_max_spread;
+
+    {
+        jlongArray arr = (*env)->NewLongArray(env, 3);
+        (*env)->SetLongArrayRegion(env, arr, 0, 3, out);
+        return arr;
+    }
 }
 
 JNIEXPORT void JNICALL
