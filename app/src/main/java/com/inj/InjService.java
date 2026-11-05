@@ -66,7 +66,7 @@ public class InjService extends VpnService {
 
     private static final int MAX_PACKET = 4096;
     private static final int MAX_BURST = 16;
-    private static final int WORKERS = 4;
+    private static final int WORKERS = 8;
     private static final int BURST_MARK = 0xFFFFFFFF;
 
     private static final int ACK_BYTE = 0x06;
@@ -81,9 +81,7 @@ public class InjService extends VpnService {
     private final AtomicLong bursts = new AtomicLong();
 
     /** Burst staging area, written by the pump thread and read by the workers. */
-    private volatile byte[][] stage1 = new byte[0][];
-    private volatile byte[][] stage2 = new byte[0][];
-    private volatile int stageCount = 0;
+    private volatile byte[][] stage = new byte[0][];
     private volatile int stageSeq = 0;
     private final AtomicInteger stageDone = new AtomicInteger(0);
 
@@ -256,14 +254,18 @@ public class InjService extends VpnService {
         }
     }
 
-    /** Hands one group to the workers and waits until all of them wrote. */
+    /**
+     * Hands one group to the workers and waits until all of them wrote.
+     *
+     * A single staging slot is safe here because every worker reports back and
+     * the call returns only after all of them are done, so the next group can
+     * never overwrite a live one. An earlier double buffer was worse than
+     * useless: the parity used for writing and the parity used for reading were
+     * taken from different values of stageSeq, so a worker could pick up the
+     * previous, shorter group and run off its end.
+     */
     private void releaseBurst(byte[][] group) {
-        if (stageSeq % 2 == 0) {
-            stage2 = group;
-        } else {
-            stage1 = group;
-        }
-        stageCount = group.length;
+        stage = group;
         stageDone.set(0);
         stageSeq++;
         long deadline = System.currentTimeMillis() + 2000;
@@ -287,13 +289,13 @@ public class InjService extends VpnService {
                     continue;
                 }
                 seen = cur;
-                byte[][] group = (cur % 2 == 0) ? stage2 : stage1;
-                int count = stageCount;
+                byte[][] group = stage;
+                int count = group.length;
                 for (int i = index; i < count; i += WORKERS) {
                     try {
                         sink.write(group[i], 0, group[i].length);
                     } catch (Exception e) {
-                        Log.e(TAG, "tun write failed", e);
+                        Log.e(TAG, "tun write failed: " + e);
                     }
                 }
                 try {
