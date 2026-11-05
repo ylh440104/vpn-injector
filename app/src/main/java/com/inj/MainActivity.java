@@ -4,12 +4,14 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.VpnService;
 import android.os.Bundle;
+import android.util.Log;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
 public class MainActivity extends Activity {
 
     private static final int REQ_VPN = 1001;
+    private static final String TAG = "InjNative";
 
     private TextView status;
 
@@ -55,32 +57,30 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Prove the native layer works before any of it is trusted.
+     * Exercise the native layer once the service is up.
      *
-     * A failed System.loadLibrary shows up here as a message instead of as an
-     * unexplained crash deep inside a race test, and the option bytes coming
-     * back out of getsockopt() confirm the whole setsockopt round trip works on
-     * this kernel.
+     * Loading the library at this point means a missing or mismatched .so shows
+     * up as a line of text rather than as an unexplained crash in the middle of
+     * a race test. Reading the options back also confirms the setsockopt round
+     * trip works on this kernel before anything relies on it.
      */
     private String nativeCheck() {
         StringBuilder sb = new StringBuilder();
+
         try {
             int[] made = Native.makeUdp(0xdeadbeef);
             if (made == null) {
-                sb.append("makeUdp failed errno=").append(android.system.Os.getErrno()).append("
-");
+                sb.append("makeUdp failed");
             } else {
                 int fd = made[0];
-                sb.append("udp fd=").append(fd).append("
-");
-                sb.append("read: ").append(Native.readOptions(fd)).append("
-");
+                sb.append("udp fd=").append(fd).append('\n');
+                sb.append("read: ").append(Native.readOptions(fd)).append('\n');
                 Native.closeFd(fd);
             }
         } catch (Throwable t) {
-            sb.append("native error: ").append(t).append("
-");
+            sb.append("native error: ").append(t);
         }
+
         return sb.toString();
     }
 
@@ -88,9 +88,9 @@ public class MainActivity extends Activity {
         Intent i = new Intent(this, InjService.class);
         i.setAction(InjService.ACTION_START);
         startForegroundService(i);
+
         String probe = nativeCheck();
-        android.util.Log.i("InjNative", probe);
-        status.setText("service started
-" + probe);
+        Log.i(TAG, probe);
+        status.setText("service started\n" + probe);
     }
 }
