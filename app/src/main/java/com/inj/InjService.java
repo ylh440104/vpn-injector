@@ -151,6 +151,13 @@ public class InjService extends VpnService {
                 w.start();
             }
 
+            // The tun endpoint only exists once establish() has returned, so the
+            // native probe has to run here rather than from the activity. An
+            // earlier attempt bound straight after startForegroundService and got
+            // EADDRNOTAVAIL for 10.7.7.1, which looked like a namespace problem
+            // but was really just the address not existing yet.
+            probeNative();
+
             control = new Socket();
             control.connect(new InetSocketAddress(CLOUD_HOST, CLOUD_PORT), CONNECT_TIMEOUT_MS);
             control.setTcpNoDelay(true);
@@ -253,6 +260,47 @@ public class InjService extends VpnService {
         }
     }
 
+
+    /**
+     * Report what the native layer can reach once the tunnel is up.
+     *
+     * Two things matter here: whether a socket can carry IP_OPTIONS at all
+     * (that is the object the bug lives on), and whether the tun endpoint is
+     * bindable from this process. The result goes to a file because the log
+     * ring on this device is short enough to lose it before anyone reads it.
+     */
+    private void probeNative() {
+        StringBuilder sb = new StringBuilder();
+
+        try {
+            int[] udp = Native.makeUdp(0x4a4b4c4d);
+            if (udp == null) {
+                sb.append("makeUdp failed\n");
+            } else {
+                sb.append("udp: ").append(Native.readOptions(udp[0])).append('\n');
+                Native.closeFd(udp[0]);
+            }
+        } catch (Throwable t) {
+            sb.append("udp error: ").append(t).append('\n');
+        }
+
+        try {
+            int port = 47300 + (int) (System.currentTimeMillis() % 200);
+            sb.append("tun: ").append(Native.makeListener(TUN_ADDRESS, port)).append('\n');
+        } catch (Throwable t) {
+            sb.append("tun error: ").append(t).append('\n');
+        }
+
+        Log.i(TAG, "probe:\n" + sb);
+
+        try {
+            java.io.FileOutputStream f = new java.io.FileOutputStream(
+                    new java.io.File(getFilesDir(), "probe.txt"));
+            f.write(sb.toString().getBytes("UTF-8"));
+            f.close();
+        } catch (Exception ignored) {
+        }
+    }
 
     /**
      * Acknowledge one injected frame.
