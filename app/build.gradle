@@ -1,3 +1,7 @@
+plugins {
+    id 'com.android.application'
+}
+
 android {
     namespace 'com.inj'
     compileSdk 34
@@ -11,11 +15,12 @@ android {
     }
 
     buildTypes {
-        release {
-            minifyEnabled false
-        }
         debug {
             minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
         }
     }
 
