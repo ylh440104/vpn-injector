@@ -297,8 +297,11 @@ public class InjService extends VpnService {
                     }
                     long n = duals.incrementAndGet();
                     if (n <= 3 || n % 25 == 0) {
+                        long[] sp = Native.raceSpread();
                         Log.i(TAG, "dual #" + n + " total=" + injected.get()
-                                + " drained=" + drained.get());
+                                + " drained=" + drained.get()
+                                + " spread last=" + sp[0] + "ns min=" + sp[1]
+                                + "ns max=" + sp[2] + "ns");
                     }
                     writeAck(out);
                     continue;
