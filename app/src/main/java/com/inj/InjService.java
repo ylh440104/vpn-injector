@@ -104,14 +104,14 @@ public class InjService extends VpnService {
     /**
      * How many spin-parked writers participate in a race frame.
      *
-     * Two was the minimum the race can work with, but it is fragile: the pair
-     * has to beat the first ACK's trip through inet_ehash_nolisten, and losing
-     * that by a few microseconds looks identical to never having tried. Four
-     * writers on four cpus give the kernel several chances to have two of them
-     * inside tcp_check_req at once, at the cost of a few extra packets per
-     * round that are simply dropped.
+     * Four was enough to prove the mechanism but not to hit the window. The
+     * useful quantity is how many arrival times land inside the few hundred
+     * nanoseconds between the first lookup and the request socket being
+     * unhashed, and that scales with the number of writers. Eight of them cover
+     * every cpu on this device, so each round samples the arrival distribution
+     * eight times instead of four.
      */
-    private static final int RACE_WRITERS = 4;
+    private static final int RACE_WRITERS = 8;
 
     private static final int ACK_BYTE = 0x06;
     private static final int OUT_BYTE = 0x07;
