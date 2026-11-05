@@ -71,5 +71,23 @@ public final class Native {
     /** Stop and join the race writers. */
     public static native void raceStop();
 
+    /**
+     * Accept one connection on a listening fd created by makeListener.
+     *
+     * Returns the new fd, or -errno. The Java layer has no way to accept on a
+     * raw fd, and the attack listener only exists as one.
+     */
+    public static native int acceptFd(int fd);
+
+    /**
+     * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
+     *
+     * This is the direct view of the bug: a child whose request socket lost the
+     * ehash race keeps a pointer to an options object that the losing child
+     * already freed, so what comes back here is whatever that slab slot holds
+     * now instead of the options the SYN carried.
+     */
+    public static native String readFdOptions(int fd);
+
     public static native int closeFd(int fd);
 }
