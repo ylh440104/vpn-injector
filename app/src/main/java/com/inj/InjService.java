@@ -17,28 +17,32 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Owns a tun device, a listener on the tunnel endpoint, and a control channel
  * back to the machine that builds packets.
  *
- * No routes are added. The kernel installs its own connected route for the
- * interface address, which is enough: the endpoint stays a local address, so a
- * packet written to the tun is processed by ip_rcv and delivered to the local
- * socket exactly as if it had arrived on a physical interface. Adding an
- * explicit route over the subnet instead made endpoint traffic get pulled into
- * the tun read side and never reach the socket.
+ * The tun write path runs the whole receive stack in the softirq raised by the
+ * writing thread (tun_get_user -> netif_rx_ni), so the cpu that executes
+ * ip_rcv/tcp_v4_rcv is the cpu of the thread that does write(). A single writer
+ * thread therefore serialises every injected packet onto one core, and a race
+ * on one request socket cannot happen no matter how the packets are framed.
  *
- * The read side is forwarded back over the control channel rather than dropped.
- * The kernel's replies go to the forged source address, which has no owner, so
- * the only way to see them and to answer with a matching ACK is to hand them
- * back to the machine that is building the packets.
+ * A "burst" frame exists for exactly that reason. The server marks a group of
+ * packets, the pump thread stages them, and WORKERS threads spin on a shared
+ * generation counter so they all start writing at the same instant. With the
+ * writers on different cores the kernel processes the packets on different
+ * cores too.
  *
  * Control protocol:
  *   server -> app   4 byte big-endian length, then that many bytes of IPv4
- *   app -> server   1 byte 0x06 to acknowledge an injected packet
+ *                   0xFFFFFFFF as length, 2 byte count, then count times
+ *                   (4 byte length + payload), for a burst
+ *   app -> server   1 byte 0x06 to acknowledge an injected frame
  *                   1 byte 0x07 followed by a 4 byte length and the packet,
  *                   for every packet read back from the tun
  */
@@ -61,6 +65,10 @@ public class InjService extends VpnService {
     private static final int CONNECT_TIMEOUT_MS = 10000;
 
     private static final int MAX_PACKET = 4096;
+    private static final int MAX_BURST = 16;
+    private static final int WORKERS = 4;
+    private static final int BURST_MARK = 0xFFFFFFFF;
+
     private static final int ACK_BYTE = 0x06;
     private static final int OUT_BYTE = 0x07;
 
@@ -70,6 +78,14 @@ public class InjService extends VpnService {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong injected = new AtomicLong();
     private final AtomicLong drained = new AtomicLong();
+    private final AtomicLong bursts = new AtomicLong();
+
+    /** Burst staging area, written by the pump thread and read by the workers. */
+    private volatile byte[][] stage1 = new byte[0][];
+    private volatile byte[][] stage2 = new byte[0][];
+    private volatile int stageCount = 0;
+    private volatile int stageSeq = 0;
+    private final AtomicInteger stageDone = new AtomicInteger(0);
 
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
@@ -97,22 +113,6 @@ public class InjService extends VpnService {
             pump.start();
         }
         return START_STICKY;
-    }
-
-    /** Snapshot of the IPv4 counters, so injection effects can be attributed. */
-    private static String ipStats() {
-        try (java.io.BufferedReader r = new java.io.BufferedReader(
-                new java.io.FileReader("/proc/net/snmp"))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                if (line.startsWith("Ip: ")) {
-                    return line;
-                }
-            }
-        } catch (Exception e) {
-            return "unavailable: " + e;
-        }
-        return "missing";
     }
 
     private void pumpLoop() {
@@ -144,6 +144,14 @@ public class InjService extends VpnService {
             acceptor.setDaemon(true);
             acceptor.start();
 
+            ParcelFileDescriptor device = tun;
+            for (int i = 0; i < WORKERS; i++) {
+                final int index = i;
+                Thread w = new Thread(() -> workerLoop(device, index), "tun-w" + i);
+                w.setDaemon(true);
+                w.start();
+            }
+
             control = new Socket();
             control.connect(new InetSocketAddress(CLOUD_HOST, CLOUD_PORT), CONNECT_TIMEOUT_MS);
             control.setTcpNoDelay(true);
@@ -151,13 +159,11 @@ public class InjService extends VpnService {
             InputStream frame = control.getInputStream();
             OutputStream out = control.getOutputStream();
             controlOut = out;
-            Log.i(TAG, "control channel established");
+            Log.i(TAG, "control channel established, workers=" + WORKERS);
 
             drainer = new Thread(this::drainLoop, "tun-drain");
             drainer.setDaemon(true);
             drainer.start();
-
-            OutputStream sink = new FileOutputStream(tun.getFileDescriptor());
 
             byte[] lengthField = new byte[4];
             byte[] packet = new byte[MAX_PACKET];
@@ -173,6 +179,53 @@ public class InjService extends VpnService {
                         | ((lengthField[2] & 0xff) << 8)
                         | (lengthField[3] & 0xff);
 
+                if (length == BURST_MARK) {
+                    byte[] cnt = new byte[2];
+                    if (!readFully(frame, cnt, 2)) {
+                        break;
+                    }
+                    int count = ((cnt[0] & 0xff) << 8) | (cnt[1] & 0xff);
+                    if (count <= 0 || count > MAX_BURST) {
+                        Log.w(TAG, "rejecting burst with count " + count);
+                        break;
+                    }
+                    byte[][] group = new byte[count][];
+                    boolean ok = true;
+                    for (int i = 0; i < count; i++) {
+                        if (!readFully(frame, lengthField, 4)) {
+                            ok = false;
+                            break;
+                        }
+                        int n = ((lengthField[0] & 0xff) << 24)
+                                | ((lengthField[1] & 0xff) << 16)
+                                | ((lengthField[2] & 0xff) << 8)
+                                | (lengthField[3] & 0xff);
+                        if (n < 20 || n > MAX_PACKET) {
+                            Log.w(TAG, "rejecting burst member length " + n);
+                            ok = false;
+                            break;
+                        }
+                        byte[] one = new byte[n];
+                        if (!readFully(frame, one, n)) {
+                            ok = false;
+                            break;
+                        }
+                        group[i] = one;
+                    }
+                    if (!ok) {
+                        break;
+                    }
+                    releaseBurst(group);
+                    long n = bursts.incrementAndGet();
+                    if (n <= 3 || n % 25 == 0) {
+                        Log.i(TAG, "burst #" + n + " count=" + count
+                                + " total=" + injected.get() + " drained=" + drained.get());
+                    }
+                    out.write(ACK_BYTE);
+                    out.flush();
+                    continue;
+                }
+
                 if (length < 20 || length > MAX_PACKET) {
                     Log.w(TAG, "rejecting frame with length " + length);
                     break;
@@ -182,26 +235,12 @@ public class InjService extends VpnService {
                     break;
                 }
 
-                try {
-                    if (injected.get() == 0) {
-                        Log.i(TAG, "ip stats before: " + ipStats());
-                    }
-                    sink.write(packet, 0, length);
-                    sink.flush();
-                    long n = injected.incrementAndGet();
-                    if (n == 1) {
-                        Log.i(TAG, "first inject len=" + length + " ihl=" + (packet[0] & 0x0f)
-                                + " opts=" + (((packet[0] & 0x0f) * 4) - 20)
-                                + " proto=" + (packet[9] & 0xff));
-                        Log.i(TAG, "ip stats after 1: " + ipStats());
-                    }
-                    if (n % 20 == 1) {
-                        Log.i(TAG, "injected #" + n + " len=" + length
-                                + " drained=" + drained.get());
-                    }
-                } catch (Exception we) {
-                    Log.e(TAG, "tun write failed at #" + (injected.get() + 1), we);
-                    break;
+                releaseBurst(new byte[][]{Arrays.copyOf(packet, length)});
+
+                long n = injected.get();
+                if (n <= 6 || n % 40 == 0) {
+                    Log.i(TAG, "injected #" + n + " len=" + length
+                            + " drained=" + drained.get());
                 }
 
                 out.write(ACK_BYTE);
@@ -217,6 +256,57 @@ public class InjService extends VpnService {
         }
     }
 
+    /** Hands one group to the workers and waits until all of them wrote. */
+    private void releaseBurst(byte[][] group) {
+        if (stageSeq % 2 == 0) {
+            stage2 = group;
+        } else {
+            stage1 = group;
+        }
+        stageCount = group.length;
+        stageDone.set(0);
+        stageSeq++;
+        long deadline = System.currentTimeMillis() + 2000;
+        while (stageDone.get() < WORKERS && running.get()) {
+            if (System.currentTimeMillis() > deadline) {
+                break;
+            }
+            Thread.yield();
+        }
+        injected.addAndGet(group.length);
+    }
+
+    private void workerLoop(ParcelFileDescriptor device, int index) {
+        try {
+            OutputStream sink = new FileOutputStream(device.getFileDescriptor());
+            int seen = 0;
+            while (running.get()) {
+                int cur = stageSeq;
+                if (cur == seen) {
+                    Thread.yield();
+                    continue;
+                }
+                seen = cur;
+                byte[][] group = (cur % 2 == 0) ? stage2 : stage1;
+                int count = stageCount;
+                for (int i = index; i < count; i += WORKERS) {
+                    try {
+                        sink.write(group[i], 0, group[i].length);
+                    } catch (Exception e) {
+                        Log.e(TAG, "tun write failed", e);
+                    }
+                }
+                try {
+                    sink.flush();
+                } catch (Exception ignored) {
+                }
+                stageDone.incrementAndGet();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "worker stopped: " + e);
+        }
+    }
+
     /** Forwards everything the kernel sends toward the forged source back to the server. */
     private void drainLoop() {
         try {
@@ -228,23 +318,9 @@ public class InjService extends VpnService {
                     break;
                 }
                 long count = drained.incrementAndGet();
-                if (count <= 6) {
+                if (count <= 4) {
                     int proto = n > 9 ? (buf[9] & 0xff) : -1;
-                    String src = n >= 20 ? ((buf[12] & 0xff) + "." + (buf[13] & 0xff)
-                            + "." + (buf[14] & 0xff) + "." + (buf[15] & 0xff)) : "?";
-                    String dst = n >= 20 ? ((buf[16] & 0xff) + "." + (buf[17] & 0xff)
-                            + "." + (buf[18] & 0xff) + "." + (buf[19] & 0xff)) : "?";
-                    int ihl = n > 0 ? (buf[0] & 0x0f) * 4 : 0;
-                    String extra = "";
-                    if (proto == 6 && n >= ihl + 14) {
-                        int sport = ((buf[ihl] & 0xff) << 8) | (buf[ihl + 1] & 0xff);
-                        int dport = ((buf[ihl + 2] & 0xff) << 8) | (buf[ihl + 3] & 0xff);
-                        int flags = buf[ihl + 13] & 0xff;
-                        extra = " " + sport + "->" + dport + " flags=0x"
-                                + Integer.toHexString(flags);
-                    }
-                    Log.i(TAG, "tun read #" + count + " len=" + n + " proto=" + proto
-                            + " " + src + "->" + dst + extra);
+                    Log.i(TAG, "tun read #" + count + " len=" + n + " proto=" + proto);
                 }
 
                 OutputStream out = controlOut;
@@ -276,8 +352,6 @@ public class InjService extends VpnService {
             Socket s = null;
             try {
                 s = listener.accept();
-                Log.i(TAG, "ACCEPT from " + s.getInetAddress().getHostAddress()
-                        + ":" + s.getPort());
             } catch (Exception e) {
                 if (!running.get()) {
                     break;
