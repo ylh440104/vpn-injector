@@ -84,12 +84,43 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
+    /**
+     * Hand the native layer a listener that already carries an options object.
+     *
+     * The Java ServerSocket cannot take IP_OPTIONS, but the whole point of the
+     * bug is that the object hangs off the socket's inet_opt and gets inherited
+     * by children. Building the listener in C is the only way to get a socket
+     * whose options object is reachable from the TCP path at all.
+     */
+    private String listenerCheck() {
+        StringBuilder sb = new StringBuilder();
+
+        try {
+            int[] made = Native.makeListener(47101);
+            if (made == null) {
+                sb.append("makeListener failed\n");
+            } else {
+                sb.append("listener fd=").append(made[0]).append('\n');
+                sb.append("before: ").append(Native.readOptions(made[0])).append('\n');
+
+                int rc = Native.applyOptions(made[0], 0x11223344);
+                sb.append("applyOptions rc=").append(rc).append('\n');
+
+                sb.append("after: ").append(Native.readOptions(made[0])).append('\n');
+            }
+        } catch (Throwable t) {
+            sb.append("listener error: ").append(t);
+        }
+
+        return sb.toString();
+    }
+
     private void launchService() {
         Intent i = new Intent(this, InjService.class);
         i.setAction(InjService.ACTION_START);
         startForegroundService(i);
 
-        String probe = nativeCheck();
+        String probe = nativeCheck() + listenerCheck();
         Log.i(TAG, probe);
         status.setText("service started\n" + probe);
 
