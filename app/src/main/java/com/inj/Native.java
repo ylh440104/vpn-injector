@@ -72,6 +72,16 @@ public final class Native {
     public static native void raceStop();
 
     /**
+     * Spread of the last race round in nanoseconds: {last, min, max}.
+     *
+     * This is the measurement that decides whether the request socket race is
+     * reachable at all. The window inside tcp_v4_syn_recv_sock is on the order
+     * of a microsecond, so a spread well above that means no arrangement of the
+     * writers can ever overlap them.
+     */
+    public static native long[] raceSpread();
+
+    /**
      * Accept one connection on a listening fd created by makeListener.
      *
      * Returns the new fd, or -errno. The Java layer has no way to accept on a
