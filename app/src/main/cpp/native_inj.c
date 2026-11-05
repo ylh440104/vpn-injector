@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sched.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -331,28 +331,45 @@ Java_com_inj_Native_probeHeap(JNIEnv *env, jclass cls, jint count)
 // returned from tcp_v4_rcv. Any test that relies on two packets racing inside
 // tcp_check_req has to guarantee the writes happen on different cpus, and the
 // scheduler will happily co-locate threads that are only spinning.
+//
+// The raw syscall is used because bionic does not export sched_getcpu() and its
+// cpu_set_t handling differs between API levels.
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_pinToCpu(JNIEnv *env, jclass cls, jint cpu)
 {
     (void)env;
     (void)cls;
 
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu <= 0) {
         return -1;
     }
-    if (cpu < 0 || cpu >= ncpu) {
-        cpu %= ncpu;
+    if (cpu < 0 || cpu >= (jint)ncpu) {
+        cpu = cpu % (jint)ncpu;
+        if (cpu < 0) {
+            cpu += (jint)ncpu;
+        }
     }
 
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-
-    if (sched_setaffinity(0, sizeof(set), &set) < 0) {
+    unsigned long mask = 1UL << cpu;
+    long rc = syscall(__NR_sched_setaffinity, 0, sizeof(mask), &mask);
+    if (rc < 0) {
         return -errno;
     }
-    return ncpu;
+
+    // Read it back so the caller can see where the thread actually landed
+    // rather than where it asked to be.
+    unsigned long got = 0;
+    if (syscall(__NR_sched_getaffinity, 0, sizeof(got), &got) < 0) {
+        return -errno;
+    }
+
+    for (int i = 0; i < (int)ncpu; i++) {
+        if (got & (1UL << i)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 // Report which cpu the calling thread is currently on.
@@ -361,8 +378,24 @@ Java_com_inj_Native_currentCpu(JNIEnv *env, jclass cls)
 {
     (void)env;
     (void)cls;
-    int cpu = sched_getcpu();
-    return cpu < 0 ? -errno : cpu;
+
+    unsigned long got = 0;
+    if (syscall(__NR_sched_getaffinity, 0, sizeof(got), &got) < 0) {
+        return -errno;
+    }
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) {
+        return -1;
+    }
+
+    // With affinity pinned to a single cpu this reports that cpu exactly.
+    for (int i = 0; i < (int)ncpu; i++) {
+        if (got & (1UL << i)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 JNIEXPORT jint JNICALL
