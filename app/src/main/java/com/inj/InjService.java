@@ -84,6 +84,7 @@ public class InjService extends VpnService {
     private volatile byte[][] stage = new byte[0][];
     private volatile int stageSeq = 0;
     private final AtomicInteger stageDone = new AtomicInteger(0);
+    private final Object stageLock = new Object();
 
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
@@ -265,9 +266,13 @@ public class InjService extends VpnService {
      * previous, shorter group and run off its end.
      */
     private void releaseBurst(byte[][] group) {
-        stage = group;
-        stageDone.set(0);
-        stageSeq++;
+        synchronized (stageLock) {
+            stage = group;
+            stageDone.set(0);
+            stageSeq++;
+            stageLock.notifyAll();
+        }
+
         long deadline = System.currentTimeMillis() + 2000;
         while (stageDone.get() < WORKERS && running.get()) {
             if (System.currentTimeMillis() > deadline) {
@@ -283,9 +288,18 @@ public class InjService extends VpnService {
             OutputStream sink = new FileOutputStream(device.getFileDescriptor());
             int seen = 0;
             while (running.get()) {
-                int cur = stageSeq;
+                int cur;
+                synchronized (stageLock) {
+                    while (running.get() && stageSeq == seen) {
+                        try {
+                            stageLock.wait(200);
+                        } catch (InterruptedException ie) {
+                            return;
+                        }
+                    }
+                    cur = stageSeq;
+                }
                 if (cur == seen) {
-                    Thread.yield();
                     continue;
                 }
                 seen = cur;
