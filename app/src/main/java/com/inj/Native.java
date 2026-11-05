@@ -45,5 +45,16 @@ public final class Native {
      */
     public static native String probeHeap(int count);
 
+    /**
+     * Pin the calling thread to one cpu. Returns the cpu count, or -errno.
+     *
+     * Needed for the race: the tun receive path runs in the writer's own
+     * softirq, so writers parked on the same cpu are strictly ordered.
+     */
+    public static native int pinToCpu(int cpu);
+
+    /** Which cpu the calling thread is on right now. */
+    public static native int currentCpu();
+
     public static native int closeFd(int fd);
 }
