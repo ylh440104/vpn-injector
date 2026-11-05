@@ -4,7 +4,6 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.VpnService;
 import android.os.Bundle;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -20,33 +19,26 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(48, 96, 48, 48);
+        root.setPadding(64, 160, 64, 64);
 
         status = new TextView(this);
-        status.setText("Idle.\n\nVpnService will take over the system VPN slot.\nAny running VPN app (e.g. Clash) will be replaced.");
-
-        Button start = new Button(this);
-        start.setText("Start tunnel");
-        start.setOnClickListener(v -> prepareAndStart());
-
-        Button stop = new Button(this);
-        stop.setText("Stop tunnel");
-        stop.setOnClickListener(v -> {
-            Intent i = new Intent(this, InjService.class);
-            i.setAction(InjService.ACTION_STOP);
-            startService(i);
-            status.setText("Stopped.");
-        });
-
+        status.setTextSize(18f);
+        status.setText("starting...");
         root.addView(status);
-        root.addView(start);
-        root.addView(stop);
+
         setContentView(root);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        prepareAndStart();
     }
 
     private void prepareAndStart() {
         Intent consent = VpnService.prepare(this);
         if (consent != null) {
+            status.setText("requesting VPN consent");
             startActivityForResult(consent, REQ_VPN);
         } else {
             launchService();
@@ -58,7 +50,7 @@ public class MainActivity extends Activity {
         if (requestCode == REQ_VPN && resultCode == RESULT_OK) {
             launchService();
         } else {
-            status.setText("VPN consent denied.");
+            status.setText("VPN consent denied");
         }
     }
 
@@ -66,6 +58,6 @@ public class MainActivity extends Activity {
         Intent i = new Intent(this, InjService.class);
         i.setAction(InjService.ACTION_START);
         startForegroundService(i);
-        status.setText("Tunnel starting.\nLocal address 10.7.7.1/24\nCloud 5.180.98.79:45700");
+        status.setText("service started, watch logcat tag InjService");
     }
 }
