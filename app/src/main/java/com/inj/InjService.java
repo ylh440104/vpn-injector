@@ -521,6 +521,18 @@ public class InjService extends VpnService {
      */
     private void raceWriteLoop(ParcelFileDescriptor device, int slot) {
         OutputStream sink;
+
+        // Give every race writer its own cpu before it touches the tun.
+        //
+        // Without this the scheduler is free to park all of them on one core,
+        // and a shared core means the second write() cannot begin until the
+        // first one has returned from tcp_v4_rcv - so the two packets can never
+        // be inside tcp_check_req together, no matter how tightly the spin loop
+        // releases them.
+        int pinned = Native.pinToCpu(1 + slot);
+        int actual = Native.currentCpu();
+        Log.i(TAG, "race writer " + slot + " pin=" + pinned + " cpu=" + actual);
+
         try {
             sink = new FileOutputStream(device.getFileDescriptor());
         } catch (Exception e) {
