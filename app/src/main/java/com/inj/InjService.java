@@ -220,8 +220,7 @@ public class InjService extends VpnService {
                         Log.i(TAG, "burst #" + n + " count=" + count
                                 + " total=" + injected.get() + " drained=" + drained.get());
                     }
-                    out.write(ACK_BYTE);
-                    out.flush();
+                    writeAck(out);
                     continue;
                 }
 
@@ -242,8 +241,7 @@ public class InjService extends VpnService {
                             + " drained=" + drained.get());
                 }
 
-                out.write(ACK_BYTE);
-                out.flush();
+                writeAck(out);
             }
         } catch (Exception e) {
             Log.e(TAG, "pump stopped", e);
@@ -252,6 +250,24 @@ public class InjService extends VpnService {
             controlOut = null;
             Log.i(TAG, "pump finished, injected=" + injected.get()
                     + " drained=" + drained.get() + ", tun still up");
+        }
+    }
+
+
+    /**
+     * Acknowledge one injected frame.
+     *
+     * The same socket also carries packets read back from the tun, and those
+     * are written by the drain thread. Both directions are framed, so an
+     * unsynchronised ack byte can land in the middle of a 0x07 frame and the
+     * receiver loses framing for every packet after that. That failure looks
+     * exactly like "the kernel stopped replying": drained keeps climbing on the
+     * device while the server sees an empty queue.
+     */
+    private void writeAck(OutputStream out) throws Exception {
+        synchronized (out) {
+            out.write(ACK_BYTE);
+            out.flush();
         }
     }
 
