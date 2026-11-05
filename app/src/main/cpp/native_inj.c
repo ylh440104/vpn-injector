@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -320,6 +321,48 @@ Java_com_inj_Native_probeHeap(JNIEnv *env, jclass cls, jint count)
              made, mismatched, bad_length, dup,
              detail[0] ? " |" : "", detail);
     return (*env)->NewStringUTF(env, out);
+}
+
+// Pin the calling thread to one cpu.
+//
+// The tun receive path runs in the calling thread's softirq, so two writers
+// that end up on the same cpu are serialised no matter how precisely they are
+// released together: the second write cannot even start until the first one has
+// returned from tcp_v4_rcv. Any test that relies on two packets racing inside
+// tcp_check_req has to guarantee the writes happen on different cpus, and the
+// scheduler will happily co-locate threads that are only spinning.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_pinToCpu(JNIEnv *env, jclass cls, jint cpu)
+{
+    (void)env;
+    (void)cls;
+
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) {
+        return -1;
+    }
+    if (cpu < 0 || cpu >= ncpu) {
+        cpu %= ncpu;
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+
+    if (sched_setaffinity(0, sizeof(set), &set) < 0) {
+        return -errno;
+    }
+    return ncpu;
+}
+
+// Report which cpu the calling thread is currently on.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_currentCpu(JNIEnv *env, jclass cls)
+{
+    (void)env;
+    (void)cls;
+    int cpu = sched_getcpu();
+    return cpu < 0 ? -errno : cpu;
 }
 
 JNIEXPORT jint JNICALL
