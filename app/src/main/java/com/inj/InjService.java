@@ -145,6 +145,9 @@ public class InjService extends VpnService {
     private volatile boolean dualGo = false;
     private final AtomicInteger dualAck = new AtomicInteger(0);
     private volatile boolean dualDead = false;
+
+    /** True once the native race writers are running on the tun fd. */
+    private volatile boolean raceReady = false;
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
 
@@ -214,15 +217,27 @@ public class InjService extends VpnService {
                 w.start();
             }
 
-            // Two writers that live in a spin loop rather than a monitor wait.
-            // They exist only for dual frames, where the two packets have to
-            // enter write() at essentially the same moment for the request
-            // socket race to have any chance.
-            for (int i = 0; i < RACE_WRITERS; i++) {
-                final int slot = i;
-                Thread r = new Thread(() -> raceWriteLoop(device, slot), "tun-race" + i);
-                r.setDaemon(true);
-                r.start();
+            // Native race writers work straight on the tun fd, so they can only start
+            // once establish() has handed one over.
+            try {
+                int started = Native.raceStart(tun.getFd(), RACE_WRITERS);
+                raceReady = started > 0;
+                Log.i(TAG, "native race writers started=" + started);
+            } catch (Throwable t) {
+                raceReady = false;
+                Log.w(TAG, "native race start failed: " + t);
+            }
+
+            // The Java spin writers are kept as a fallback only. When the native pair
+            // is running they would just compete for the same cores and make the
+            // timing worse, so they stay off.
+            if (!raceReady) {
+                for (int i = 0; i < RACE_WRITERS; i++) {
+                    final int slot = i;
+                    Thread r = new Thread(() -> raceWriteLoop(device, slot), "tun-race" + i);
+                    r.setDaemon(true);
+                    r.start();
+                }
             }
 
             // The tun endpoint only exists once establish() has returned, so the
@@ -584,6 +599,18 @@ public class InjService extends VpnService {
      * has already picked up the new pair.
      */
     private void publishDual(byte[] a, byte[] b) {
+        // Prefer the native path. Its writers sit in a bare spin and call
+        // write() directly, which keeps the spread between them down to a cache
+        // line transfer instead of the microseconds a Java write costs.
+        if (raceReady) {
+            int fired = Native.raceFire(a, b);
+            if (fired > 0) {
+                injected.addAndGet(2);
+                return;
+            }
+            Log.w(TAG, "native race fire returned " + fired + ", falling back");
+        }
+
         int target = RACE_WRITERS;
 
         dualGo = false;
@@ -771,6 +798,15 @@ public class InjService extends VpnService {
 
     private void stopAll() {
         running.set(false);
+
+        // Join the native writers before the tun fd goes away, otherwise they
+        // are spinning on a descriptor that is about to be closed.
+        try {
+            Native.raceStop();
+        } catch (Throwable ignored) {
+        }
+        raceReady = false;
+
         closeQuietly(listener);
         listener = null;
         closeQuietly(tun);
