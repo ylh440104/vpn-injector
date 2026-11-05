@@ -489,16 +489,17 @@ public class InjService extends VpnService {
             // objects with distinct tags; if a child's pointer was dangling, one
             // of those tags now sits where the child's option bytes used to be.
 int[] fds = snapshotChildFds();
-            String before = readFds(fds);
+            String[] before = readFdsPer(fds);
             result = Native.probeHeap(count);
-            String after = readFds(fds);
+            String[] after = readFdsPer(fds);
+            int changes = countChanges(before, after);
 
-            if (!before.equals(after)) {
-                Log.w(TAG, "CHILD UAF: retained child changed after churn; before="
-                        + before + " after=" + after);
+            if (changes > 0) {
+                Log.w(TAG, "CHILD UAF: " + changes + " of " + fds.length
+                        + " retained children changed after slab churn");
             }
 
-            result = result + " | n=" + fds.length + " changed=" + !before.equals(after);
+            result = result + " | n=" + fds.length + " changed=" + changes;
         } catch (Throwable t) {
             result = "probe error: " + t;
         }
@@ -570,23 +571,33 @@ int[] fds = snapshotChildFds();
     }
 
     /**
-     * Re-read the options of exactly the given fds.
+     * Read the options of exactly the given fds, returning one entry per fd.
      *
-     * Fds that have since been evicted and closed are skipped: their reads fail
-     * with EBADF and comparing that against a real value would look like a
-     * change caused by the churn, which is exactly the false positive this
-     * function exists to avoid.
+     * Entries that could not be read are left null so the caller can compare
+     * position by position. Concatenating the results would make an fd that
+     * disappeared during the churn look like a change in the surviving ones.
      */
-    private String readFds(int[] fds) {
-        StringBuilder sb = new StringBuilder();
-        for (int fd : fds) {
-            String opts = Native.readFdOptions(fd);
-            if (opts.startsWith("none")) {
+    private String[] readFdsPer(int[] fds) {
+        String[] out = new String[fds.length];
+        for (int i = 0; i < fds.length; i++) {
+            String opts = Native.readFdOptions(fds[i]);
+            out[i] = opts.startsWith("none") ? null : opts;
+        }
+        return out;
+    }
+
+    /** Compare two per-fd snapshots, ignoring fds that were unreadable either time. */
+    private int countChanges(String[] before, String[] after) {
+        int changes = 0;
+        for (int i = 0; i < before.length && i < after.length; i++) {
+            if (before[i] == null || after[i] == null) {
                 continue;
             }
-            sb.append(opts).append(';');
+            if (!before[i].equals(after[i])) {
+                changes++;
+            }
         }
-        return sb.toString();
+        return changes;
     }
 
     /**
