@@ -203,9 +203,23 @@ public class InjService extends VpnService {
                     break;
                 }
                 long count = drained.incrementAndGet();
-                if (count <= 3) {
-                    Log.i(TAG, "tun read #" + count + " len=" + n + " proto="
-                            + (n > 9 ? (buf[9] & 0xff) : -1));
+                if (count <= 6) {
+                    int proto = n > 9 ? (buf[9] & 0xff) : -1;
+                    String src = n >= 20 ? ((buf[12] & 0xff) + "." + (buf[13] & 0xff)
+                            + "." + (buf[14] & 0xff) + "." + (buf[15] & 0xff)) : "?";
+                    String dst = n >= 20 ? ((buf[16] & 0xff) + "." + (buf[17] & 0xff)
+                            + "." + (buf[18] & 0xff) + "." + (buf[19] & 0xff)) : "?";
+                    int ihl = n > 0 ? (buf[0] & 0x0f) * 4 : 0;
+                    String extra = "";
+                    if (proto == 6 && n >= ihl + 14) {
+                        int sport = ((buf[ihl] & 0xff) << 8) | (buf[ihl + 1] & 0xff);
+                        int dport = ((buf[ihl + 2] & 0xff) << 8) | (buf[ihl + 3] & 0xff);
+                        int flags = buf[ihl + 13] & 0xff;
+                        extra = " " + sport + "->" + dport + " flags=0x"
+                                + Integer.toHexString(flags);
+                    }
+                    Log.i(TAG, "tun read #" + count + " len=" + n + " proto=" + proto
+                            + " " + src + "->" + dst + extra);
                 }
 
                 OutputStream out = controlOut;
