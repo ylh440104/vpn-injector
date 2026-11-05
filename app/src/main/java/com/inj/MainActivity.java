@@ -96,17 +96,14 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
 
         try {
-            int[] made = Native.makeListener(47101);
-            if (made == null) {
-                sb.append("makeListener failed\n");
-            } else {
-                sb.append("listener fd=").append(made[0]).append('\n');
-                sb.append("before: ").append(Native.readOptions(made[0])).append('\n');
-
-                int rc = Native.applyOptions(made[0], 0x11223344);
-                sb.append("applyOptions rc=").append(rc).append('\n');
-
-                sb.append("after: ").append(Native.readOptions(made[0])).append('\n');
+            // Two candidates: the tun endpoint that the injected traffic targets,
+            // and the wildcard, which also collects the same SYN when the
+            // destination is routed locally. Whichever binds tells us which one
+            // the VPN namespace actually exposes.
+            String[] addrs = {"10.7.7.1", "0.0.0.0"};
+            for (String a : addrs) {
+                String r = Native.makeListener(a, 47101);
+                sb.append(a).append(" -> ").append(r).append('\n');
             }
         } catch (Throwable t) {
             sb.append("listener error: ").append(t);
