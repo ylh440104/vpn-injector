@@ -56,5 +56,20 @@ public final class Native {
     /** Which cpu the calling thread is on right now. */
     public static native int currentCpu();
 
+    /**
+     * Start the native race writers on an existing tun fd.
+     *
+     * These live entirely in C because the race window is hundreds of
+     * nanoseconds wide. A Java writer costs microseconds between leaving its
+     * spin and entering tun_get_user, which is an order of magnitude too slow.
+     */
+    public static native int raceStart(int fd, int count);
+
+    /** Release every race writer with a pair of packets; returns how many fired. */
+    public static native int raceFire(byte[] a, byte[] b);
+
+    /** Stop and join the race writers. */
+    public static native void raceStop();
+
     public static native int closeFd(int fd);
 }
