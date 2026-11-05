@@ -349,14 +349,15 @@ public class InjService extends VpnService {
     }
 
     /**
-     * Hands one group to the workers and waits until all of them wrote.
+     * Hands one group to the workers and waits until every worker that had
+     * something to write has finished.
      *
-     * A single staging slot is safe here because every worker reports back and
-     * the call returns only after all of them are done, so the next group can
-     * never overwrite a live one. An earlier double buffer was worse than
-     * useless: the parity used for writing and the parity used for reading were
-     * taken from different values of stageSeq, so a worker could pick up the
-     * previous, shorter group and run off its end.
+     * The wait used to be for WORKERS unconditionally, which deadlocked every
+     * burst shorter than the worker count: with four packets only workers 0..3
+     * have data, workers 4..7 wake up, see no new generation for them, and go
+     * back to waiting without ever reporting. The counter then sat at four
+     * forever and the timeout did the waiting - two seconds per burst, which
+     * turned a 43 round run into a stalled crawl.
      */
     private void releaseBurst(byte[][] group) {
         synchronized (stageLock) {
@@ -366,6 +367,11 @@ public class InjService extends VpnService {
             stageLock.notifyAll();
         }
 
+        // Every worker bumps the counter once per generation, including those
+        // with no packet to write. Waiting for all of them is what makes the
+        // staging slot safe: the next group cannot be published until the
+        // previous one has been consumed by every thread that might still be
+        // reading it.
         long deadline = System.currentTimeMillis() + 2000;
         while (stageDone.get() < WORKERS && running.get()) {
             if (System.currentTimeMillis() > deadline) {
@@ -398,17 +404,30 @@ public class InjService extends VpnService {
                 seen = cur;
                 byte[][] group = stage;
                 int count = group.length;
+
+                boolean wrote = false;
                 for (int i = index; i < count; i += WORKERS) {
                     try {
                         sink.write(group[i], 0, group[i].length);
+                        wrote = true;
                     } catch (Exception e) {
                         Log.e(TAG, "tun write failed: " + e);
                     }
                 }
-                try {
-                    sink.flush();
-                } catch (Exception ignored) {
+                if (wrote) {
+                    try {
+                        sink.flush();
+                    } catch (Exception ignored) {
+                    }
                 }
+
+                // Report even when this worker had no packet in the group.
+                //
+                // The coordinator waits for min(WORKERS, count) reports, and a
+                // worker whose index is past the end has nothing to write but
+                // still has to acknowledge the generation - otherwise the
+                // counter never reaches the target and every burst pays the
+                // full timeout.
                 stageDone.incrementAndGet();
             }
         } catch (Exception e) {
