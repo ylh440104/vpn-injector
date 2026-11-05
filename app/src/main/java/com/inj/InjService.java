@@ -12,19 +12,24 @@ import android.util.Log;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Holds a tun device and relays pre-built IPv4 packets from the control server
- * into it.  Whatever is written to the tun write end is handed to the kernel as
- * if it had arrived on that interface, so the normal receive path runs and the
- * local listener sees a genuine segment.  No raw sockets and therefore no
- * CAP_NET_RAW are involved.
+ * Owns a tun device, a listener bound inside that tun, and a control channel
+ * back to the machine that builds packets.
  *
- * The route is deliberately scoped to the tunnel subnet only.  A default route
- * would swallow the control channel's own traffic and deadlock the session.
+ * Packets written to the tun write end are handed to the kernel as if they had
+ * arrived on the interface, so the listener sees them through the ordinary
+ * receive path. That is the whole point: it gives us TCP segments with an
+ * arbitrary source address, source port and sequence number without needing
+ * CAP_NET_RAW on this device.
+ *
+ * The route is scoped to the tunnel subnet. A default route would swallow the
+ * control channel's own traffic and deadlock the session.
  */
 public class InjService extends VpnService {
 
@@ -37,6 +42,10 @@ public class InjService extends VpnService {
     private static final int TUN_PREFIX = 24;
     private static final String TUN_SUBNET = "10.7.7.0";
     private static final int TUN_MTU = 1500;
+
+    /** Listener that absorbing the injected SYNs. */
+    private static final int LISTEN_PORT = 47100;
+    private static final int LISTEN_BACKLOG = 128;
 
     private static final String CLOUD_HOST = "5.180.98.79";
     private static final int CLOUD_PORT = 45700;
@@ -51,14 +60,16 @@ public class InjService extends VpnService {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private ParcelFileDescriptor tun;
+    private ServerSocket listener;
     private Thread pump;
+    private Thread acceptor;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
 
         if (ACTION_STOP.equals(action)) {
-            stopPump();
+            stopAll();
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -86,17 +97,24 @@ public class InjService extends VpnService {
                 builder.setBlocking(true);
             }
 
-            // Keep our own control socket off the tunnel we are creating.
-            if (Build.VERSION.SDK_INT >= 22) {
-                setUnderlyingNetworks(null);
-            }
-
             tun = builder.establish();
             if (tun == null) {
                 Log.e(TAG, "establish returned null: no consent, or another VPN is active");
                 return;
             }
             Log.i(TAG, "tun up, fd=" + tun.getFd() + ", route " + TUN_SUBNET + "/" + TUN_PREFIX);
+
+            // The listener must be bound after establish(), otherwise the
+            // address does not exist yet and bind() fails with EADDRNOTAVAIL.
+            listener = new ServerSocket();
+            listener.setReuseAddress(true);
+            listener.bind(new InetSocketAddress(
+                    InetAddress.getByName(TUN_ADDRESS), LISTEN_PORT), LISTEN_BACKLOG);
+            Log.i(TAG, "listener bound " + TUN_ADDRESS + ":" + LISTEN_PORT);
+
+            acceptor = new Thread(this::acceptLoop, "tun-accept");
+            acceptor.setDaemon(true);
+            acceptor.start();
 
             OutputStream sink = new FileOutputStream(tun.getFileDescriptor());
 
@@ -136,13 +154,32 @@ public class InjService extends VpnService {
 
                 ack.write(ACK_BYTE);
                 ack.flush();
+                Log.i(TAG, "injected " + length + " bytes");
             }
         } catch (Exception e) {
             Log.e(TAG, "pump stopped", e);
         } finally {
             closeQuietly(control);
-            releaseTun();
+            stopAll();
             running.set(false);
+        }
+    }
+
+    /** Drains the listener so the accept queue never fills and stalls the SYN path. */
+    private void acceptLoop() {
+        while (running.get()) {
+            Socket s = null;
+            try {
+                s = listener.accept();
+                Log.i(TAG, "accepted from " + s.getInetAddress().getHostAddress()
+                        + ":" + s.getPort());
+            } catch (Exception e) {
+                if (!running.get()) {
+                    break;
+                }
+            } finally {
+                closeQuietly(s);
+            }
         }
     }
 
@@ -158,20 +195,17 @@ public class InjService extends VpnService {
         return true;
     }
 
-    private void stopPump() {
-        running.set(false);
-        Thread t = pump;
-        pump = null;
-        if (t != null) {
-            t.interrupt();
-        }
-        releaseTun();
-    }
-
-    private synchronized void releaseTun() {
-        ParcelFileDescriptor p = tun;
+    private void stopAll() {
+        closeQuietly(listener);
+        listener = null;
+        closeQuietly(tun);
         tun = null;
-        closeQuietly(p);
+
+        Thread a = acceptor;
+        acceptor = null;
+        if (a != null) {
+            a.interrupt();
+        }
     }
 
     private static void closeQuietly(AutoCloseable c) {
@@ -207,7 +241,7 @@ public class InjService extends VpnService {
 
     @Override
     public void onDestroy() {
-        stopPump();
+        stopAll();
         super.onDestroy();
     }
 }
