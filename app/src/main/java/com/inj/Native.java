@@ -36,5 +36,14 @@ public final class Native {
     /** UDP socket carrying its own options object, as a control case. */
     public static native int[] makeUdp(int tag);
 
+    /**
+     * Allocate count options objects with tag == index, then read every one
+     * back and report anomalies.
+     *
+     * A clean slab run reports mismatched=0 badlen=0 dup=0. A duplicate free
+     * shows up as a socket whose tag is not its own, or the same tag twice.
+     */
+    public static native String probeHeap(int count);
+
     public static native int closeFd(int fd);
 }
