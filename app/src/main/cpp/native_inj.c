@@ -459,9 +459,19 @@ static void *race_thread(void *arg)
 {
     int slot = (int)(intptr_t)arg;
 
-    // One cpu per writer, before the first packet is ever sent.
-    unsigned long mask = 1UL << (1 + slot);
-    syscall(__NR_sched_setaffinity, 0, sizeof(mask), &mask);
+    // One cpu per writer, starting at 1 so cpu 0 - which carries most of the
+    // system work on this device - is left alone. If the device has fewer cpus
+    // than writers, wrap around instead of asking for a core that does not
+    // exist, which would silently leave the thread unpinned.
+    {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int want = 1 + slot;
+        if (ncpu > 1) {
+            want = 1 + (slot % (int)(ncpu - 1));
+        }
+        unsigned long mask = 1UL << want;
+        syscall(__NR_sched_setaffinity, 0, sizeof(mask), &mask);
+    }
 
     int seen = 0;
     while (!g_race.stop) {
