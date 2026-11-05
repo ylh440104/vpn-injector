@@ -201,6 +201,127 @@ Java_com_inj_Native_makeUdp(JNIEnv *env, jclass cls, jint tag)
     return out;
 }
 
+// Allocate many options objects with distinct tags, then read them all back.
+//
+// This is the detector for the double free. If inet_ehash_nolisten() failed
+// and freed an ip_options_rcu that the request socket still pointed at, the
+// same kmalloc-96 slot comes back twice. Two sockets then own one object, the
+// second setsockopt overwrites the first one's bytes, and reading either back
+// shows a tag that belongs to the other - or shows one of them twice.
+//
+// Every socket gets tag = index, so a clean run returns exactly one hit per
+// index. Anything else means the slab handed out a duplicate slot.
+JNIEXPORT jstring JNICALL
+Java_com_inj_Native_probeHeap(JNIEnv *env, jclass cls, jint count)
+{
+    (void)cls;
+
+    if (count < 2) {
+        count = 2;
+    }
+    if (count > 128) {
+        count = 128;
+    }
+
+    int *fds = (int *)calloc((size_t)count, sizeof(int));
+    if (fds == NULL) {
+        return (*env)->NewStringUTF(env, "alloc failed");
+    }
+
+    int made = 0;
+    for (int i = 0; i < count; i++) {
+        fds[i] = -1;
+
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            break;
+        }
+
+        unsigned char opts[40];
+        fill_rr(opts, sizeof(opts), (uint32_t)i);
+        if (setsockopt(fd, IPPROTO_IP, IP_OPTIONS, opts, sizeof(opts)) < 0) {
+            close(fd);
+            continue;
+        }
+
+        fds[i] = fd;
+        made++;
+    }
+
+    // Read every object back after all of them exist. Reading as we go would
+    // miss the case where a later allocation overwrote an earlier one.
+    int mismatched = 0;
+    int bad_length = 0;
+    int dup = 0;
+    char detail[256];
+    detail[0] = '\0';
+
+    unsigned char seen[128];
+    memset(seen, 0, sizeof(seen));
+
+    for (int i = 0; i < count; i++) {
+        if (fds[i] < 0) {
+            continue;
+        }
+
+        unsigned char buf[64];
+        socklen_t len = sizeof(buf);
+        memset(buf, 0, sizeof(buf));
+
+        if (getsockopt(fds[i], IPPROTO_IP, IP_OPTIONS, buf, &len) < 0) {
+            bad_length++;
+            continue;
+        }
+
+        if (len != 40) {
+            bad_length++;
+            if (detail[0] == '\0') {
+                snprintf(detail, sizeof(detail),
+                         " first anomaly: slot %d reported len=%d", i, (int)len);
+            }
+            continue;
+        }
+
+        // The tag sits at bytes 3..6 of the option area. Anything else means
+        // these bytes do not belong to this socket.
+        uint32_t tag = ((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16)
+                     | ((uint32_t)buf[5] << 8) | (uint32_t)buf[6];
+
+        if (tag != (uint32_t)i) {
+            mismatched++;
+            if (detail[0] == '\0') {
+                snprintf(detail, sizeof(detail),
+                         " first anomaly: slot %d holds tag %u", i, tag);
+            }
+        }
+
+        if (tag < 128) {
+            if (seen[tag]) {
+                dup++;
+                if (detail[0] == '\0') {
+                    snprintf(detail, sizeof(detail),
+                             " first anomaly: tag %u seen twice", tag);
+                }
+            }
+            seen[tag] = 1;
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (fds[i] >= 0) {
+            close(fds[i]);
+        }
+    }
+    free(fds);
+
+    char out[512];
+    snprintf(out, sizeof(out),
+             "made=%d mismatched=%d badlen=%d dup=%d%s%s",
+             made, mismatched, bad_length, dup,
+             detail[0] ? " |" : "", detail);
+    return (*env)->NewStringUTF(env, out);
+}
+
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_closeFd(JNIEnv *env, jclass cls, jint fd)
 {
