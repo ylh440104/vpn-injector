@@ -100,23 +100,28 @@ Java_com_inj_Native_readOptions(JNIEnv *env, jclass cls, jint fd)
 
 // Listening TCP socket on addr:port.
 //
-// The address is passed in because the interesting one is the tun endpoint,
-// which only exists inside the app's VPN namespace. A caller that guesses wrong
-// should be able to see which address it actually tried.
-JNIEXPORT jstring JNICALL
+// Returns {fd, 0} on success or {-1, errno} on failure. The kernel fd is handed
+// back rather than kept here because everything that matters afterwards -
+// setsockopt(IP_OPTIONS), the SYN that creates a request socket, the child that
+// inherits the options object - happens on this one descriptor.
+JNIEXPORT jintArray JNICALL
 Java_com_inj_Native_makeListener(JNIEnv *env, jclass cls, jstring addr, jint port)
 {
     (void)cls;
 
+    jint out[2];
+    out[0] = -1;
+    out[1] = 0;
+
     const char *addr_utf = (*env)->GetStringUTFChars(env, addr, NULL);
-    char tried[128];
-    snprintf(tried, sizeof(tried), "%s:%d", addr_utf, (int)port);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        int e = errno;
+        out[1] = errno;
         (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
-        return err(env, "socket", e);
+        jintArray r = (*env)->NewIntArray(env, 2);
+        (*env)->SetIntArrayRegion(env, r, 0, 2, out);
+        return r;
     }
 
     // Without this a listener cannot be recreated during a test run while old
@@ -129,32 +134,35 @@ Java_com_inj_Native_makeListener(JNIEnv *env, jclass cls, jstring addr, jint por
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, addr_utf, &sa.sin_addr) != 1) {
-        int e = EINVAL;
+        out[1] = EINVAL;
         close(fd);
         (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
-        return err(env, "inet_pton", e);
+        jintArray r = (*env)->NewIntArray(env, 2);
+        (*env)->SetIntArrayRegion(env, r, 0, 2, out);
+        return r;
     }
     (*env)->ReleaseStringUTFChars(env, addr, addr_utf);
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        int e = errno;
+        out[1] = errno;
         close(fd);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "bind %s: %s (%d)", tried, strerror(e), e);
-        return (*env)->NewStringUTF(env, msg);
+        jintArray r = (*env)->NewIntArray(env, 2);
+        (*env)->SetIntArrayRegion(env, r, 0, 2, out);
+        return r;
     }
 
     if (listen(fd, 128) < 0) {
-        int e = errno;
+        out[1] = errno;
         close(fd);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "listen %s: %s (%d)", tried, strerror(e), e);
-        return (*env)->NewStringUTF(env, msg);
+        jintArray r = (*env)->NewIntArray(env, 2);
+        (*env)->SetIntArrayRegion(env, r, 0, 2, out);
+        return r;
     }
 
-    char ok[192];
-    snprintf(ok, sizeof(ok), "OK fd=%d %s", fd, tried);
-    return (*env)->NewStringUTF(env, ok);
+    out[0] = fd;
+    jintArray r = (*env)->NewIntArray(env, 2);
+    (*env)->SetIntArrayRegion(env, r, 0, 2, out);
+    return r;
 }
 
 // UDP socket carrying its own options object, no TCP involved.
