@@ -12,23 +12,25 @@ import android.util.Log;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.Socket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Owns a tun device and relays pre-built IPv4 packets from the control server
- * into it.
+ * Owns a tun device, a listener on the tunnel endpoint, and a control channel
+ * back to the machine that builds packets.
  *
- * Deliberately adds no routes. A route over the tunnel subnet would make the
- * kernel treat traffic addressed to the tunnel endpoint as tunnel traffic and
- * hand it to the read side of the tun instead of delivering it locally. With no
- * route the endpoint stays a plain local address, so a packet written here is
- * processed by ip_rcv and delivered to the local socket exactly as if it had
- * arrived on a physical interface.
+ * No routes are added. The kernel installs its own connected route for the
+ * interface address, which is enough: the endpoint stays a local address, so a
+ * packet written to the tun is processed by ip_rcv and delivered to the local
+ * socket exactly as if it had arrived on a physical interface. Adding an
+ * explicit route over the subnet instead made the endpoint traffic get pulled
+ * into the tun read side and never reach the socket.
  *
- * That gives us TCP segments with an arbitrary source address, source port and
- * sequence number without CAP_NET_RAW on this device.
+ * This is what gives us TCP segments with an arbitrary source address, source
+ * port and sequence number without CAP_NET_RAW on this device.
  */
 public class InjService extends VpnService {
 
@@ -40,6 +42,9 @@ public class InjService extends VpnService {
     private static final String TUN_ADDRESS = "10.7.7.1";
     private static final int TUN_PREFIX = 24;
     private static final int TUN_MTU = 1500;
+
+    private static final int LISTEN_PORT = 47100;
+    private static final int LISTEN_BACKLOG = 128;
 
     private static final String CLOUD_HOST = "5.180.98.79";
     private static final int CLOUD_PORT = 45700;
@@ -54,7 +59,9 @@ public class InjService extends VpnService {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private ParcelFileDescriptor tun;
+    private ServerSocket listener;
     private Thread pump;
+    private Thread acceptor;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -87,15 +94,23 @@ public class InjService extends VpnService {
             if (Build.VERSION.SDK_INT >= 29) {
                 builder.setBlocking(true);
             }
-            // No addRoute on purpose, see the class comment.
 
             tun = builder.establish();
             if (tun == null) {
                 Log.e(TAG, "establish returned null: no consent, or another VPN is active");
                 return;
             }
-            Log.i(TAG, "tun up, fd=" + tun.getFd() + ", address " + TUN_ADDRESS
-                    + "/" + TUN_PREFIX + ", no routes");
+            Log.i(TAG, "tun up, fd=" + tun.getFd() + ", address " + TUN_ADDRESS + "/" + TUN_PREFIX);
+
+            listener = new ServerSocket();
+            listener.setReuseAddress(true);
+            listener.bind(new InetSocketAddress(
+                    InetAddress.getByName(TUN_ADDRESS), LISTEN_PORT), LISTEN_BACKLOG);
+            Log.i(TAG, "listener bound " + TUN_ADDRESS + ":" + LISTEN_PORT);
+
+            acceptor = new Thread(this::acceptLoop, "tun-accept");
+            acceptor.setDaemon(true);
+            acceptor.start();
 
             OutputStream sink = new FileOutputStream(tun.getFileDescriptor());
 
@@ -145,6 +160,23 @@ public class InjService extends VpnService {
         }
     }
 
+    private void acceptLoop() {
+        while (running.get()) {
+            Socket s = null;
+            try {
+                s = listener.accept();
+                Log.i(TAG, "ACCEPT from " + s.getInetAddress().getHostAddress()
+                        + ":" + s.getPort());
+            } catch (Exception e) {
+                if (!running.get()) {
+                    break;
+                }
+            } finally {
+                closeQuietly(s);
+            }
+        }
+    }
+
     private static boolean readFully(InputStream in, byte[] dst, int count) throws Exception {
         int offset = 0;
         while (offset < count) {
@@ -158,8 +190,16 @@ public class InjService extends VpnService {
     }
 
     private void stopAll() {
+        closeQuietly(listener);
+        listener = null;
         closeQuietly(tun);
         tun = null;
+
+        Thread a = acceptor;
+        acceptor = null;
+        if (a != null) {
+            a.interrupt();
+        }
     }
 
     private static void closeQuietly(AutoCloseable c) {
