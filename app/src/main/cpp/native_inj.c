@@ -476,6 +476,8 @@ static void *race_thread(void *arg)
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_raceStart(JNIEnv *env, jclass cls, jint fd, jint count)
 {
+    int i;
+
     (void)env;
     (void)cls;
 
@@ -494,7 +496,7 @@ Java_com_inj_Native_raceStart(JNIEnv *env, jclass cls, jint fd, jint count)
     g_race.count = count;
     g_race.stop = 0;
 
-    for (int i = 0; i < count; i++) {
+    for (i = 0; i < count; i++) {
         if (pthread_create(&g_race_threads[i], NULL, race_thread,
                            (void *)(intptr_t)i) != 0) {
             g_race.stop = 1;
@@ -511,14 +513,17 @@ Java_com_inj_Native_raceStart(JNIEnv *env, jclass cls, jint fd, jint count)
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_raceFire(JNIEnv *env, jclass cls, jbyteArray a, jbyteArray b)
 {
+    jsize la, lb;
+    unsigned long long spins;
+
     (void)cls;
 
     if (!g_race_started) {
         return -1;
     }
 
-    jsize la = (*env)->GetArrayLength(env, a);
-    jsize lb = (*env)->GetArrayLength(env, b);
+    la = (*env)->GetArrayLength(env, a);
+    lb = (*env)->GetArrayLength(env, b);
     if (la > (jsize)sizeof(g_race.buf[0]) || lb > (jsize)sizeof(g_race.buf[0])) {
         return -2;
     }
@@ -526,13 +531,16 @@ Java_com_inj_Native_raceFire(JNIEnv *env, jclass cls, jbyteArray a, jbyteArray b
     // Fill every other slot with the same two payloads. All writers race, and
     // getting two of them through the window is what matters - which two is up
     // to the scheduler.
-    for (int i = 0; i < g_race.count; i++) {
-        if ((i & 1) == 0) {
-            (*env)->GetByteArrayRegion(env, a, 0, la, (jbyte *)g_race.buf[i]);
-            g_race.buflen[i] = la;
-        } else {
-            (*env)->GetByteArrayRegion(env, b, 0, lb, (jbyte *)g_race.buf[i]);
-            g_race.buflen[i] = lb;
+    {
+        int i;
+        for (i = 0; i < g_race.count; i++) {
+            if ((i & 1) == 0) {
+                (*env)->GetByteArrayRegion(env, a, 0, la, (jbyte *)g_race.buf[i]);
+                g_race.buflen[i] = (int)la;
+            } else {
+                (*env)->GetByteArrayRegion(env, b, 0, lb, (jbyte *)g_race.buf[i]);
+                g_race.buflen[i] = (int)lb;
+            }
         }
     }
 
@@ -542,9 +550,8 @@ Java_com_inj_Native_raceFire(JNIEnv *env, jclass cls, jbyteArray a, jbyteArray b
     // One store releases every spinner at once.
     g_race.target++;
 
-    uint64_t deadline = 0;
-    while (g_race.done < g_race.count) {
-        if (++deadline > 400000000ULL) {
+    for (spins = 0; g_race.done < g_race.count; spins++) {
+        if (spins > 400000000ULL) {
             return -3;
         }
     }
