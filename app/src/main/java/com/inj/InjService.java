@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -17,20 +18,25 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Owns a tun device, a listener on the tunnel endpoint, and a control channel
  * back to the machine that builds packets.
  *
- * No routes are added. The kernel installs its own connected route for the
- * interface address, which is enough: the endpoint stays a local address, so a
- * packet written to the tun is processed by ip_rcv and delivered to the local
- * socket exactly as if it had arrived on a physical interface. Adding an
- * explicit route over the subnet instead made the endpoint traffic get pulled
- * into the tun read side and never reach the socket.
+ * Two things matter here.
  *
- * This is what gives us TCP segments with an arbitrary source address, source
- * port and sequence number without CAP_NET_RAW on this device.
+ * First, no routes are added. The kernel installs its own connected route for
+ * the interface address, which is enough: the endpoint stays a local address,
+ * so a packet written to the tun is processed by ip_rcv and delivered to the
+ * local socket exactly as if it had arrived on a physical interface. Adding an
+ * explicit route over the subnet instead made endpoint traffic get pulled into
+ * the tun read side and never reach the socket.
+ *
+ * Second, the read side must be drained. When the kernel answers an injected
+ * SYN it sends the SYN-ACK back toward the forged source address, which the
+ * connected route points at the tun. If nobody reads, the queue fills up and
+ * the interface stalls, so the drain loop below throws those packets away.
  */
 public class InjService extends VpnService {
 
@@ -57,10 +63,13 @@ public class InjService extends VpnService {
     private static final String CHANNEL_ID = "inj";
 
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicLong injected = new AtomicLong();
+    private final AtomicLong drained = new AtomicLong();
 
     private ParcelFileDescriptor tun;
     private ServerSocket listener;
     private Thread pump;
+    private Thread drainer;
     private Thread acceptor;
 
     @Override
@@ -112,6 +121,10 @@ public class InjService extends VpnService {
             acceptor.setDaemon(true);
             acceptor.start();
 
+            drainer = new Thread(this::drainLoop, "tun-drain");
+            drainer.setDaemon(true);
+            drainer.start();
+
             OutputStream sink = new FileOutputStream(tun.getFileDescriptor());
 
             control = new Socket();
@@ -127,7 +140,7 @@ public class InjService extends VpnService {
 
             while (running.get()) {
                 if (!readFully(frame, lengthField, 4)) {
-                    Log.w(TAG, "control channel closed");
+                    Log.w(TAG, "control channel closed, keeping tun alive for observation");
                     break;
                 }
 
@@ -145,8 +158,18 @@ public class InjService extends VpnService {
                     break;
                 }
 
-                sink.write(packet, 0, length);
-                sink.flush();
+                try {
+                    sink.write(packet, 0, length);
+                    sink.flush();
+                    long n = injected.incrementAndGet();
+                    if (n % 20 == 1) {
+                        Log.i(TAG, "injected #" + n + " len=" + length
+                                + " drained=" + drained.get());
+                    }
+                } catch (Exception we) {
+                    Log.e(TAG, "tun write failed at #" + (injected.get() + 1), we);
+                    break;
+                }
 
                 ack.write(ACK_BYTE);
                 ack.flush();
@@ -155,8 +178,27 @@ public class InjService extends VpnService {
             Log.e(TAG, "pump stopped", e);
         } finally {
             closeQuietly(control);
-            stopAll();
-            running.set(false);
+            // Deliberately leave the tun and listener up so the state can be
+            // inspected after the control channel goes away.
+            Log.i(TAG, "pump finished, injected=" + injected.get()
+                    + " drained=" + drained.get() + ", tun still up");
+        }
+    }
+
+    /** Consumes whatever the kernel sends back toward the forged source address. */
+    private void drainLoop() {
+        try {
+            FileInputStream source = new FileInputStream(tun.getFileDescriptor());
+            byte[] buf = new byte[MAX_PACKET];
+            while (running.get()) {
+                int n = source.read(buf);
+                if (n <= 0) {
+                    break;
+                }
+                drained.incrementAndGet();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "drain loop ended: " + e);
         }
     }
 
@@ -190,6 +232,7 @@ public class InjService extends VpnService {
     }
 
     private void stopAll() {
+        running.set(false);
         closeQuietly(listener);
         listener = null;
         closeQuietly(tun);
@@ -199,6 +242,11 @@ public class InjService extends VpnService {
         acceptor = null;
         if (a != null) {
             a.interrupt();
+        }
+        Thread d = drainer;
+        drainer = null;
+        if (d != null) {
+            d.interrupt();
         }
     }
 
