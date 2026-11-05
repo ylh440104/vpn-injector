@@ -85,31 +85,15 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Hand the native layer a listener that already carries an options object.
+     * Left as a placeholder.
      *
-     * The Java ServerSocket cannot take IP_OPTIONS, but the whole point of the
-     * bug is that the object hangs off the socket's inet_opt and gets inherited
-     * by children. Building the listener in C is the only way to get a socket
-     * whose options object is reachable from the TCP path at all.
+     * The listener probe moved into InjService because the tun address only
+     * exists after establish() returns; running it from the activity raced the
+     * VPN coming up and produced EADDRNOTAVAIL for an address that was merely
+     * not there yet.
      */
     private String listenerCheck() {
-        StringBuilder sb = new StringBuilder();
-
-        try {
-            // Fresh port each run: a previous install can leave a listener
-            // behind on the old port, and EADDRINUSE would otherwise look like
-            // a namespace failure.
-            int port = 47200 + (int) (System.currentTimeMillis() % 200);
-            String[] addrs = {"10.7.7.1", "0.0.0.0"};
-            for (String a : addrs) {
-                String r = Native.makeListener(a, port);
-                sb.append(a).append(":").append(port).append(" -> ").append(r).append('\n');
-            }
-        } catch (Throwable t) {
-            sb.append("listener error: ").append(t);
-        }
-
-        return sb.toString();
+        return "";
     }
 
     private void launchService() {
