@@ -488,16 +488,17 @@ public class InjService extends VpnService {
             // somebody else first. probeHeap allocates a batch of options
             // objects with distinct tags; if a child's pointer was dangling, one
             // of those tags now sits where the child's option bytes used to be.
-            String before = readChildRing();
+int[] fds = snapshotChildFds();
+            String before = readFds(fds);
             result = Native.probeHeap(count);
-            String after = readChildRing();
+            String after = readFds(fds);
 
             if (!before.equals(after)) {
                 Log.w(TAG, "CHILD UAF: retained child changed after churn; before="
                         + before + " after=" + after);
             }
 
-            result = result + " | before=" + before + " after=" + after;
+            result = result + " | n=" + fds.length + " changed=" + !before.equals(after);
         } catch (Throwable t) {
             result = "probe error: " + t;
         }
@@ -544,6 +545,46 @@ public class InjService extends VpnService {
                 }
                 sb.append(Native.readFdOptions(fd)).append(';');
             }
+        }
+        return sb.toString();
+    }
+
+    /** Copy of the retained fds, so a comparison is not confused by rotation. */
+    private int[] snapshotChildFds() {
+        synchronized (childRing) {
+            int n = 0;
+            for (int fd : childRing) {
+                if (fd >= 0) {
+                    n++;
+                }
+            }
+            int[] out = new int[n];
+            int i = 0;
+            for (int fd : childRing) {
+                if (fd >= 0) {
+                    out[i++] = fd;
+                }
+            }
+            return out;
+        }
+    }
+
+    /**
+     * Re-read the options of exactly the given fds.
+     *
+     * Fds that have since been evicted and closed are skipped: their reads fail
+     * with EBADF and comparing that against a real value would look like a
+     * change caused by the churn, which is exactly the false positive this
+     * function exists to avoid.
+     */
+    private String readFds(int[] fds) {
+        StringBuilder sb = new StringBuilder();
+        for (int fd : fds) {
+            String opts = Native.readFdOptions(fd);
+            if (opts.startsWith("none")) {
+                continue;
+            }
+            sb.append(opts).append(';');
         }
         return sb.toString();
     }
