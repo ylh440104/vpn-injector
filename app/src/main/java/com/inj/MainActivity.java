@@ -96,14 +96,14 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
 
         try {
-            // Two candidates: the tun endpoint that the injected traffic targets,
-            // and the wildcard, which also collects the same SYN when the
-            // destination is routed locally. Whichever binds tells us which one
-            // the VPN namespace actually exposes.
+            // Fresh port each run: a previous install can leave a listener
+            // behind on the old port, and EADDRINUSE would otherwise look like
+            // a namespace failure.
+            int port = 47200 + (int) (System.currentTimeMillis() % 200);
             String[] addrs = {"10.7.7.1", "0.0.0.0"};
             for (String a : addrs) {
-                String r = Native.makeListener(a, 47101);
-                sb.append(a).append(" -> ").append(r).append('\n');
+                String r = Native.makeListener(a, port);
+                sb.append(a).append(":").append(port).append(" -> ").append(r).append('\n');
             }
         } catch (Throwable t) {
             sb.append("listener error: ").append(t);
