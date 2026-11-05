@@ -99,6 +99,22 @@ public class InjService extends VpnService {
         return START_STICKY;
     }
 
+    /** Snapshot of the IPv4 counters, so injection effects can be attributed. */
+    private static String ipStats() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/net/snmp"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("Ip: ")) {
+                    return line;
+                }
+            }
+        } catch (Exception e) {
+            return "unavailable: " + e;
+        }
+        return "missing";
+    }
+
     private void pumpLoop() {
         Socket control = null;
 
@@ -167,9 +183,18 @@ public class InjService extends VpnService {
                 }
 
                 try {
+                    if (injected.get() == 0) {
+                        Log.i(TAG, "ip stats before: " + ipStats());
+                    }
                     sink.write(packet, 0, length);
                     sink.flush();
                     long n = injected.incrementAndGet();
+                    if (n == 1) {
+                        Log.i(TAG, "first inject len=" + length + " ihl=" + (packet[0] & 0x0f)
+                                + " opts=" + (((packet[0] & 0x0f) * 4) - 20)
+                                + " proto=" + (packet[9] & 0xff));
+                        Log.i(TAG, "ip stats after 1: " + ipStats());
+                    }
                     if (n % 20 == 1) {
                         Log.i(TAG, "injected #" + n + " len=" + length
                                 + " drained=" + drained.get());
