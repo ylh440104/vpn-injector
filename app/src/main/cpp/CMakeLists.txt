@@ -9,7 +9,7 @@ set_target_properties(injnative PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
 find_library(log-lib log)
 
-# pthread is part of libc on modern Android, but the race writers really do
-# call pthread_create and pthread_join, so link it explicitly rather than
-# relying on the platform default.
-target_link_libraries(injnative ${log-lib} pthread)
+# No -lpthread here on purpose: bionic merged pthread into libc and the NDK no
+# longer ships a libpthread stub, so asking for it fails at link time with
+# "unable to find library -lpthread".
+target_link_libraries(injnative ${log-lib})
