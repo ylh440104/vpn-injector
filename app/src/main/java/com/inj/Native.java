@@ -102,6 +102,12 @@ public final class Native {
     public static native long spraySameCpu(int cpu, int ms);
 
     /**
+     * Accept, RST-close and immediately re-allocate the freed slab slot, all on
+     * one cpu. Returns how many children were recycled.
+     */
+    public static native long recycleSpin(int fd, int cpu, int ms);
+
+    /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
      * This is the direct view of the bug: a child whose request socket lost the
