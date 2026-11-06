@@ -164,6 +164,8 @@ public class InjService extends VpnService {
     private final int[] childRing = {-1, -1, -1, -1, -1, -1, -1, -1};
     private int childRingPos = 0;
     private ParcelFileDescriptor tun;
+    /** Forwards real traffic out of the same tunnel; null until it is up. */
+    private TunForwarder forwarder;
     private ServerSocket listener;
 
     /** Raw fd of the listener that carries IP options; -1 until establish() runs. */
@@ -178,8 +180,6 @@ public class InjService extends VpnService {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
-
-        forwardMode = intent != null && intent.getBooleanExtra(EXTRA_FORWARD, false);
 
         if (ACTION_STOP.equals(action)) {
             stopAll();
@@ -197,55 +197,22 @@ public class InjService extends VpnService {
         return START_STICKY;
     }
 
-    /** True when this run provides internet access instead of driving the race. */
-    private volatile boolean forwardMode = false;
-
-    /**
-     * Bring the tunnel up as a real VPN and forward everything through the
-     * shadowsocks exit.
-     *
-     * The app excludes itself from its own tunnel: the forwarding sockets have
-     * to leave over wifi, otherwise the encapsulated traffic would be fed back
-     * into the tunnel and loop.
-     */
-    private void runForwardMode() throws Exception {
-        Builder builder = new Builder();
-        builder.setSession("inj-vpn");
-        builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
-        builder.setMtu(TUN_MTU);
-        builder.addRoute("0.0.0.0", 0);
-        builder.addDnsServer(SS_DNS);
-        if (Build.VERSION.SDK_INT >= 29) {
-            builder.setBlocking(true);
-        }
-        builder.addDisallowedApplication(getPackageName());
-
-        tun = builder.establish();
-        if (tun == null) {
-            Log.e(TAG, "forward: establish returned null");
-            return;
-        }
-        Log.i(TAG, "forward mode up, exit=" + SS_HOST + ":" + SS_PORT);
-
-        FileInputStream tin = new FileInputStream(tun.getFileDescriptor());
-        FileOutputStream tout = new FileOutputStream(tun.getFileDescriptor());
-        TunForwarder forwarder = new TunForwarder(tin, tout, SS_HOST, SS_PORT,
-                SS_PASSWORD, SS_DNS);
-        forwarder.run();
-        forwarder.stop();
-    }
-
     private void pumpLoop() {
         Socket control = null;
         try {
-            if (forwardMode) {
-                runForwardMode();
-                return;
-            }
             Builder builder = new Builder();
             builder.setSession("inj");
             builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
             builder.setMtu(TUN_MTU);
+            // Carry the device's real traffic as well as the injected packets.
+            // The app excludes itself, otherwise its own forwarding sockets
+            // would be routed back into the tunnel.
+            builder.addRoute("0.0.0.0", 0);
+            builder.addDnsServer(SS_DNS);
+            try {
+                builder.addDisallowedApplication(getPackageName());
+            } catch (Exception ignored) {
+            }
             if (Build.VERSION.SDK_INT >= 29) {
                 builder.setBlocking(true);
             }
@@ -256,6 +223,10 @@ public class InjService extends VpnService {
                 return;
             }
             Log.i(TAG, "tun up, fd=" + tun.getFd() + ", address " + TUN_ADDRESS + "/" + TUN_PREFIX);
+            forwarder = new TunForwarder(null,
+                    new FileOutputStream(tun.getFileDescriptor()),
+                    SS_HOST, SS_PORT, SS_PASSWORD, SS_DNS);
+            Log.i(TAG, "forwarding real traffic to " + SS_HOST + ":" + SS_PORT);
 
             listener = new ServerSocket();
             listener.setReuseAddress(true);
@@ -950,6 +921,12 @@ int[] fds = snapshotChildFds();
     }
 
     /** Forwards everything the kernel sends toward the forged source back to the server. */
+    /** True when the destination address sits in the forged 10.7.7.0/24. */
+    private static boolean isRaceTraffic(byte[] p, int len) {
+        return len >= 20 && (p[0] >> 4) == 4
+                && (p[16] & 0xff) == 10 && (p[17] & 0xff) == 7 && (p[18] & 0xff) == 7;
+    }
+
     private void drainLoop() {
         try {
             FileInputStream source = new FileInputStream(tun.getFileDescriptor());
@@ -963,6 +940,20 @@ int[] fds = snapshotChildFds();
                 if (count <= 4) {
                     int proto = n > 9 ? (buf[9] & 0xff) : -1;
                     Log.i(TAG, "tun read #" + count + " len=" + n + " proto=" + proto);
+                }
+
+                // Two consumers share this tunnel. Packets addressed into the
+                // forged subnet belong to the race and go to the controller;
+                // everything else is real traffic and leaves via shadowsocks.
+                if (!isRaceTraffic(buf, n)) {
+                    TunForwarder f = forwarder;
+                    if (f != null) {
+                        try {
+                            f.handle(buf, n);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    continue;
                 }
 
                 OutputStream out = controlOut;
