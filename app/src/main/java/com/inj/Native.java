@@ -121,6 +121,15 @@ public final class Native {
     public static native int dualWrite(int fd, byte[] a, int aLen,
                                        byte[] b, int bLen, int cpuA, int cpuB);
 
+    /** Start a resident writer pinned to cpu, living for the whole run. */
+    public static native int duoStart(int slot, int cpu);
+
+    /** Load a packet into a resident writer slot. */
+    public static native int duoArm(int slot, int fd, byte[] pkt, int len);
+
+    /** Release every armed resident writer at the same instant. */
+    public static native int duoFire();
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
