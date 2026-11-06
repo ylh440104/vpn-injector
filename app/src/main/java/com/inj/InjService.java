@@ -208,6 +208,18 @@ public class InjService extends VpnService {
             builder.setSession("inj");
             builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
             builder.setMtu(TUN_MTU);
+            // Cold-route playground.
+            //
+            // inet_csk_route_req() looks up a route for the SYN's source address
+            // while building the SYNACK, and that lookup is the slowest part of
+            // the reader's path. Sources inside the tunnel subnet always hit the
+            // connected route; these blocks never do, so every round pays for a
+            // full FIB walk and the window between taking ireq_opt and copying it
+            // out grows from microseconds to tens of microseconds. All three are
+            // private or reserved, so real traffic never lands here.
+            builder.addRoute("172.16.0.0", 12);
+            builder.addRoute("100.64.0.0", 10);
+            builder.addRoute("198.18.0.0", 15);
             if (Build.VERSION.SDK_INT >= 29) {
                 builder.setBlocking(true);
             }
@@ -989,10 +1001,26 @@ int[] fds = snapshotChildFds();
     }
 
     /** Forwards everything the kernel sends toward the forged source back to the server. */
-    /** True when the destination address sits in the forged 10.7.7.0/24. */
+    /** True when the destination is one of the forged peer ranges. */
     private static boolean isRaceTraffic(byte[] p, int len) {
-        return len >= 20 && (p[0] >> 4) == 4
-                && (p[16] & 0xff) == 10 && (p[17] & 0xff) == 7 && (p[18] & 0xff) == 7;
+        if (len < 20 || (p[0] >> 4) != 4) {
+            return false;
+        }
+        int d0 = p[16] & 0xff;
+        int d1 = p[17] & 0xff;
+        if (d0 == 10 && d1 == 7) {
+            return true;              /* 10.7.7.0/24, the connected subnet */
+        }
+        if (d0 == 172 && d1 >= 16 && d1 <= 31) {
+            return true;              /* 172.16.0.0/12 */
+        }
+        if (d0 == 100 && d1 >= 64 && d1 <= 127) {
+            return true;              /* 100.64.0.0/10 */
+        }
+        if (d0 == 198 && (d1 == 18 || d1 == 19)) {
+            return true;              /* 198.18.0.0/15 */
+        }
+        return false;
     }
 
     private void drainLoop() {
