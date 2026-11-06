@@ -95,6 +95,9 @@ public final class Native {
     /** Accept and RST children (SO_LINGER 0) in a tight native loop. */
     public static native long rstSrtt(int fd, int rounds);
 
+    /** Spin on accept4(NONBLOCK) and RST every child for ms milliseconds. */
+    public static native long rstSpin(int fd, int ms);
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
