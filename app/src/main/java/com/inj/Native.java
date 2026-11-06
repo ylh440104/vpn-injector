@@ -89,6 +89,9 @@ public final class Native {
      */
     public static native int acceptFd(int fd);
 
+    /** Accept and close children in a tight native loop; returns how many. */
+    public static native long acceptClose(int fd, int count);
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
