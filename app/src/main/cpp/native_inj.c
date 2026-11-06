@@ -1062,6 +1062,7 @@ typedef struct {
     int len;
     int cpu;
     volatile int *go;
+    int errno_seen;
 } duo_arg;
 
 static void *duo_worker(void *arg)
@@ -1076,7 +1077,9 @@ static void *duo_worker(void *arg)
     for (spin = 0; !*a->go && spin < 200000000; spin++) {
         __sync_synchronize();
     }
-    write(a->fd, a->pkt, (size_t) a->len);
+    if (write(a->fd, a->pkt, (size_t) a->len) < 0) {
+        a->errno_seen = errno;
+    }
     return NULL;
 }
 
@@ -1108,12 +1111,14 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
     arg1.len = aLen;
     arg1.cpu = cpuA;
     arg1.go = &go;
+    arg1.errno_seen = 0;
 
     arg2.fd = fd;
     arg2.pkt = (const unsigned char *) pb;
     arg2.len = bLen;
     arg2.cpu = cpuB;
     arg2.go = &go;
+    arg2.errno_seen = 0;
 
     if (pthread_create(&t1, NULL, duo_worker, &arg1) != 0) {
         (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
@@ -1138,6 +1143,12 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
 
     (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
     (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+    if (arg1.errno_seen) {
+        return -100 - arg1.errno_seen;
+    }
+    if (arg2.errno_seen) {
+        return -200 - arg2.errno_seen;
+    }
     return 0;
 }
 // Read IP_OPTIONS from a socket and report what came back.
