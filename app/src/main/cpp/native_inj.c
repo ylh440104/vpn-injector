@@ -1063,6 +1063,7 @@ typedef struct {
     int cpu;
     volatile int *go;
     int errno_seen;
+    int wrote;
 } duo_arg;
 
 static void *duo_worker(void *arg)
@@ -1081,7 +1082,8 @@ static void *duo_worker(void *arg)
     for (spin = 0; !*a->go && spin < 200000000; spin++) {
         __sync_synchronize();
     }
-    if (write(a->fd, a->pkt, (size_t) a->len) < 0) {
+    a->wrote = (int) write(a->fd, a->pkt, (size_t) a->len);
+    if (a->wrote < 0) {
         a->errno_seen = errno;
     }
     return NULL;
@@ -1116,6 +1118,7 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
     arg1.cpu = cpuA;
     arg1.go = &go;
     arg1.errno_seen = 0;
+    arg1.wrote = 0;
 
     arg2.fd = fd;
     arg2.pkt = (const unsigned char *) pb;
@@ -1123,6 +1126,7 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
     arg2.cpu = cpuB;
     arg2.go = &go;
     arg2.errno_seen = 0;
+    arg2.wrote = 0;
 
     if (pthread_create(&t1, NULL, duo_worker, &arg1) != 0) {
         (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
@@ -1148,10 +1152,16 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
     (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
     (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
     if (arg1.errno_seen) {
-        return -100 - arg1.errno_seen;
+        return -1000 - arg1.errno_seen;
     }
     if (arg2.errno_seen) {
-        return -200 - arg2.errno_seen;
+        return -2000 - arg2.errno_seen;
+    }
+    if (arg1.wrote != aLen) {
+        return -100000 - arg1.wrote;
+    }
+    if (arg2.wrote != bLen) {
+        return -200000 - arg2.wrote;
     }
     return 0;
 }
