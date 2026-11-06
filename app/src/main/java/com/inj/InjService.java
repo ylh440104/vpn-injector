@@ -172,6 +172,7 @@ public class InjService extends VpnService {
 
     /** Raw fd of the listener that carries IP options; -1 until establish() runs. */
     private volatile int attackFd = -1;
+    private int duoLogged = 0;
 
     private Thread pump;
     private Thread drainer;
@@ -722,8 +723,11 @@ int[] fds = snapshotChildFds();
         ParcelFileDescriptor device = tun;
         if (device != null) {
             try {
-                Native.dualWrite(device.getFd(), first, first.length,
+                int rc = Native.dualWrite(device.getFd(), first, first.length,
                         second, second.length, cpuA, cpuB);
+                if (rc != 0 && (duoLogged++ % 200) == 0) {
+                    Log.w(TAG, "dualWrite rc=" + rc + " fd=" + device.getFd());
+                }
             } catch (Exception e) {
                 Log.w(TAG, "duo failed: " + e);
             }
