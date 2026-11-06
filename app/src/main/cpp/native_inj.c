@@ -928,7 +928,7 @@ Java_com_inj_Native_recycleSpin(JNIEnv *env, jclass cls, jint fd, jint cpu, jint
 JNIEXPORT jint JNICALL
 Java_com_inj_Native_duoDelay(JNIEnv *env, jclass cls, jint fd,
                              jbyteArray a, jint aLen,
-                             jbyteArray b, jint bLen, jint delayUs)
+                             jbyteArray b, jint bLen, jint delayNs)
 {
     struct timespec ts0, ts;
     jbyte *pa, *pb;
@@ -952,13 +952,13 @@ Java_com_inj_Native_duoDelay(JNIEnv *env, jclass cls, jint fd,
         return -3;
     }
 
-    if (delayUs > 0) {
+    if (delayNs > 0) {
         clock_gettime(CLOCK_MONOTONIC, &ts0);
         for (;;) {
             clock_gettime(CLOCK_MONOTONIC, &ts);
             long el = (ts.tv_sec - ts0.tv_sec) * 1000000000L
                     + (ts.tv_nsec - ts0.tv_nsec);
-            if (el >= (long) delayUs * 1000L) {
+            if (el >= (long) delayNs) {
                 break;
             }
         }
