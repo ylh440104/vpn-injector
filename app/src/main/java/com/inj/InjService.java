@@ -629,7 +629,7 @@ int[] fds = snapshotChildFds();
         // and microseconds is all the kernel's window is worth - the two reads
         // of opt->optlen sit about two hundred nanoseconds apart.
         while (running.get() && attackFd == fd) {
-            long n = Native.rstSrtt(fd, 4096);
+            long n = Native.rstSpin(fd, 50);
             if (n <= 0) {
                 break;
             }
