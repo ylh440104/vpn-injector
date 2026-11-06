@@ -704,9 +704,16 @@ int[] fds = snapshotChildFds();
                 | ((delay[1] & 0xff) << 16)
                 | ((delay[2] & 0xff) << 8)
                 | (delay[3] & 0xff);
-        int fd = attackFd;
-        if (fd >= 0) {
-            Native.duoDelay(fd, first, first.length, second, second.length, delayNs);
+        // The tun fd, not the listener: these two packets have to be written
+        // into the tunnel, and the listener fd is not writable at all.
+        ParcelFileDescriptor device = tun;
+        if (device != null) {
+            try {
+                Native.duoDelay(device.getFd(), first, first.length,
+                        second, second.length, delayNs);
+            } catch (Exception e) {
+                Log.w(TAG, "duo failed: " + e);
+            }
         }
         return true;
     }
