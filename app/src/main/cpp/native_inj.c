@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include <time.h>
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -745,6 +746,37 @@ Java_com_inj_Native_rstSrtt(JNIEnv *env, jclass cls, jint fd, jint rounds)
         setsockopt(conn, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         close(conn);
         done++;
+    }
+    return done;
+}
+JNIEXPORT jlong JNICALL
+Java_com_inj_Native_rstSpin(JNIEnv *env, jclass cls, jint fd, jint ms)
+{
+    struct timespec ts0, ts;
+    long done = 0;
+    (void)env;
+    (void)cls;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for (;;) {
+        int conn = accept4(fd, NULL, NULL, SOCK_NONBLOCK);
+        if (conn >= 0) {
+            struct linger lg;
+            lg.l_onoff = 1;
+            lg.l_linger = 0;
+            setsockopt(conn, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+            close(conn);
+            done++;
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if ((ts.tv_sec - ts0.tv_sec) * 1000L
+                + (ts.tv_nsec - ts0.tv_nsec) / 1000000L >= ms) {
+            break;
+        }
     }
     return done;
 }
