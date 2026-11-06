@@ -1068,10 +1068,14 @@ typedef struct {
 static void *duo_worker(void *arg)
 {
     duo_arg *a = (duo_arg *) arg;
-    unsigned long mask = 1UL << a->cpu;
     int spin;
 
-    syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask);
+    if (a->cpu > 0) {
+        /* Pinning is optional: a spinning writer on the same core starves the
+         * softirq that has to drain the tunnel afterwards. */
+        unsigned long mask = 1UL << a->cpu;
+        syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask);
+    }
 
     /* Park until the caller releases both writers. */
     for (spin = 0; !*a->go && spin < 200000000; spin++) {
