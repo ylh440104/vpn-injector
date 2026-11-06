@@ -92,6 +92,9 @@ public final class Native {
     /** Accept and close children in a tight native loop; returns how many. */
     public static native long acceptClose(int fd, int count);
 
+    /** Accept and RST children (SO_LINGER 0) in a tight native loop. */
+    public static native long rstSrtt(int fd, int rounds);
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
