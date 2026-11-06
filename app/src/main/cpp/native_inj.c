@@ -918,6 +918,62 @@ Java_com_inj_Native_recycleSpin(JNIEnv *env, jclass cls, jint fd, jint cpu, jint
     }
     return done;
 }
+// Two writes with a calibrated gap between them.
+//
+// The order matters and so does the spacing. The ACK has to run far enough
+// ahead that its child is queued, closed and its options object already
+// recycled into a fresh allocation before the retransmitted SYN reaches
+// ip_options_build - otherwise the copy happens first and reads perfectly
+// ordinary memory. A few microseconds is the whole difference.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_duoDelay(JNIEnv *env, jclass cls, jint fd,
+                             jbyteArray a, jint aLen,
+                             jbyteArray b, jint bLen, jint delayUs)
+{
+    struct timespec ts0, ts;
+    jbyte *pa, *pb;
+    (void)env;
+    (void)cls;
+
+    if (aLen <= 0 || aLen > 4096 || bLen <= 0 || bLen > 4096) {
+        return -1;
+    }
+    pa = (*env)->GetByteArrayElements(env, a, NULL);
+    pb = (*env)->GetByteArrayElements(env, b, NULL);
+    if (pa == NULL || pb == NULL) {
+        if (pa) (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        if (pb) (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -2;
+    }
+
+    if (write(fd, pa, (size_t) aLen) != (ssize_t) aLen) {
+        (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -3;
+    }
+
+    if (delayUs > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        for (;;) {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long el = (ts.tv_sec - ts0.tv_sec) * 1000000000L
+                    + (ts.tv_nsec - ts0.tv_nsec);
+            if (el >= (long) delayUs * 1000L) {
+                break;
+            }
+        }
+    }
+
+    if (write(fd, pb, (size_t) bLen) != (ssize_t) bLen) {
+        (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -4;
+    }
+
+    (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+    return 0;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
