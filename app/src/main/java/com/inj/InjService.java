@@ -721,9 +721,9 @@ int[] fds = snapshotChildFds();
         // native rendezvous is tight enough to do that.
         int cpuA = (delayNs >> 8) & 0xFF;
         int cpuB = delayNs & 0xFF;
-        if (cpuA == 0 || cpuB == 0 || cpuA == cpuB) {
-            cpuA = 1;
-            cpuB = 2;
+        if (cpuA == cpuB) {
+            cpuA = 0;
+            cpuB = 0;
         }
         ParcelFileDescriptor device = tun;
         if (device != null) {
