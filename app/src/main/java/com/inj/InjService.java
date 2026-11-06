@@ -696,14 +696,17 @@ int[] fds = snapshotChildFds();
                 second = one;
             }
         }
-        byte[] delay = new byte[2];
-        if (!readFully(frame, delay, 2)) {
+        byte[] delay = new byte[4];
+        if (!readFully(frame, delay, 4)) {
             return false;
         }
-        int delayUs = ((delay[0] & 0xff) << 8) | (delay[1] & 0xff);
+        int delayNs = ((delay[0] & 0xff) << 24)
+                | ((delay[1] & 0xff) << 16)
+                | ((delay[2] & 0xff) << 8)
+                | (delay[3] & 0xff);
         int fd = attackFd;
         if (fd >= 0) {
-            Native.duoDelay(fd, first, first.length, second, second.length, delayUs);
+            Native.duoDelay(fd, first, first.length, second, second.length, delayNs);
         }
         return true;
     }
