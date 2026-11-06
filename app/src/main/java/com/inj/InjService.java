@@ -71,6 +71,14 @@ public class InjService extends VpnService {
 
     private static final String CLOUD_HOST = "5.180.98.79";
     private static final int CLOUD_PORT = 45700;
+
+    /** Shadowsocks exit used by forward mode. */
+    private static final String SS_HOST = "5.180.98.79";
+    private static final int SS_PORT = 8388;
+    private static final String SS_PASSWORD = "Kx9mQ2vL7wR4tY8u";
+    private static final String SS_DNS = "223.5.5.5";
+
+    static final String EXTRA_FORWARD = "forward";
     private static final int CONNECT_TIMEOUT_MS = 10000;
 
     private static final int MAX_PACKET = 4096;
@@ -171,6 +179,8 @@ public class InjService extends VpnService {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
 
+        forwardMode = intent != null && intent.getBooleanExtra(EXTRA_FORWARD, false);
+
         if (ACTION_STOP.equals(action)) {
             stopAll();
             stopSelf();
@@ -187,10 +197,51 @@ public class InjService extends VpnService {
         return START_STICKY;
     }
 
+    /** True when this run provides internet access instead of driving the race. */
+    private volatile boolean forwardMode = false;
+
+    /**
+     * Bring the tunnel up as a real VPN and forward everything through the
+     * shadowsocks exit.
+     *
+     * The app excludes itself from its own tunnel: the forwarding sockets have
+     * to leave over wifi, otherwise the encapsulated traffic would be fed back
+     * into the tunnel and loop.
+     */
+    private void runForwardMode() throws Exception {
+        Builder builder = new Builder();
+        builder.setSession("inj-vpn");
+        builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
+        builder.setMtu(TUN_MTU);
+        builder.addRoute("0.0.0.0", 0);
+        builder.addDnsServer(SS_DNS);
+        if (Build.VERSION.SDK_INT >= 29) {
+            builder.setBlocking(true);
+        }
+        builder.addDisallowedApplication(getPackageName());
+
+        tun = builder.establish();
+        if (tun == null) {
+            Log.e(TAG, "forward: establish returned null");
+            return;
+        }
+        Log.i(TAG, "forward mode up, exit=" + SS_HOST + ":" + SS_PORT);
+
+        FileInputStream tin = new FileInputStream(tun.getFileDescriptor());
+        FileOutputStream tout = new FileOutputStream(tun.getFileDescriptor());
+        TunForwarder forwarder = new TunForwarder(tin, tout, SS_HOST, SS_PORT,
+                SS_PASSWORD, SS_DNS);
+        forwarder.run();
+        forwarder.stop();
+    }
+
     private void pumpLoop() {
         Socket control = null;
-
         try {
+            if (forwardMode) {
+                runForwardMode();
+                return;
+            }
             Builder builder = new Builder();
             builder.setSession("inj");
             builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
