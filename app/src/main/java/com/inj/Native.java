@@ -112,6 +112,12 @@ public final class Native {
                                       byte[] b, int bLen, int delayNs);
 
     /**
+     * Allocate count IP_OPTIONS objects with unique markers and count how many
+     * read back wrong, which happens when two sockets share one slab slot.
+     */
+    public static native int dupProbe(int count, int tag);
+
+    /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
      * This is the direct view of the bug: a child whose request socket lost the
