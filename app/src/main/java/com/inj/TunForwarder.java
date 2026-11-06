@@ -72,13 +72,13 @@ final class TunForwarder {
                 break;
             }
             try {
-                handlePacket(buf, n);
+                handle(buf, n);
             } catch (Exception ignored) {
             }
         }
     }
 
-    private void handlePacket(byte[] p, int len) throws IOException {
+    void handle(byte[] p, int len) throws IOException {
         if (len < 20 || (p[0] >> 4) != 4) {
             return;
         }
@@ -90,7 +90,17 @@ final class TunForwarder {
         int dstStart = 16;
 
         if (proto == IPV4_UDP) {
-            handleUdp(p, len, ihl);
+            // DNS waits on a real socket, so it must not stall the tunnel loop
+            // that also carries the injected packets.
+            final byte[] copy = new byte[len];
+            System.arraycopy(p, 0, copy, 0, len);
+            final int udpOff = ihl;
+            new Thread(() -> {
+                try {
+                    handleUdp(copy, copy.length, udpOff);
+                } catch (Exception ignored) {
+                }
+            }, "dns").start();
             return;
         }
         if (proto != IPV4_TCP) {
