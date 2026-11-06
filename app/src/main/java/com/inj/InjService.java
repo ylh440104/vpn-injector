@@ -1051,8 +1051,7 @@ int[] fds = snapshotChildFds();
                     try {
                         java.io.File f = new java.io.File(getExternalFilesDir(null), "dup.txt");
                         java.io.FileOutputStream fo = new java.io.FileOutputStream(f, true);
-                        fo.write(("hit " + found + " tag=" + tag + "
-").getBytes("UTF-8"));
+                        fo.write(("hit " + found + " tag=" + tag + "\n").getBytes("UTF-8"));
                         fo.close();
                     } catch (Exception ignored) {
                     }
