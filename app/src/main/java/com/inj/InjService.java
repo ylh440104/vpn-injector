@@ -1056,7 +1056,21 @@ int[] fds = snapshotChildFds();
      * and we have proof the double free ran.
      */
     private void dupWatchLoop() {
-        int tag = 0x1000;
+        // One watcher per cpu: a freed slot goes back to the per-cpu freelist of
+        // whichever core ran the free, so a single unpinned watcher only ever
+        // sees its own core's list.
+        int ncpu = Runtime.getRuntime().availableProcessors();
+        for (int c = 0; c < ncpu; c++) {
+            final int cpu = c;
+            Thread t = new Thread(() -> dupWatchCpu(cpu), "tun-dup" + cpu);
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    private void dupWatchCpu(int cpu) {
+        Native.pinToCpu(cpu);
+        int tag = 0x1000 + (cpu << 12);
         long total = 0;
         while (running.get()) {
             try {
@@ -1064,10 +1078,11 @@ int[] fds = snapshotChildFds();
                     Thread.sleep(400);
                     continue;
                 }
-                int found = Native.dupProbe(256, tag++);
+                int found = Native.dupProbe(512, tag++);
                 if (found > 0) {
                     total += found;
-                    Log.i(TAG, "DUP SLOT HIT found=" + found + " total=" + total);
+                    Log.i(TAG, "DUP SLOT HIT cpu=" + cpu + " found=" + found
+                            + " total=" + total);
                     try {
                         java.io.File f = new java.io.File(getExternalFilesDir(null), "dup.txt");
                         java.io.FileOutputStream fo = new java.io.FileOutputStream(f, true);
