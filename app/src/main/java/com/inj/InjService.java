@@ -710,11 +710,20 @@ int[] fds = snapshotChildFds();
                 | (delay[3] & 0xff);
         // The tun fd, not the listener: these two packets have to be written
         // into the tunnel, and the listener fd is not writable at all.
+        // The field carries a cpu pair, not a delay: the two writers have to
+        // leave from different cores within the same instant, and only a
+        // native rendezvous is tight enough to do that.
+        int cpuA = (delayNs >> 8) & 0xFF;
+        int cpuB = delayNs & 0xFF;
+        if (cpuA == 0 || cpuB == 0 || cpuA == cpuB) {
+            cpuA = 1;
+            cpuB = 2;
+        }
         ParcelFileDescriptor device = tun;
         if (device != null) {
             try {
-                Native.duoDelay(device.getFd(), first, first.length,
-                        second, second.length, delayNs);
+                Native.dualWrite(device.getFd(), first, first.length,
+                        second, second.length, cpuA, cpuB);
             } catch (Exception e) {
                 Log.w(TAG, "duo failed: " + e);
             }
