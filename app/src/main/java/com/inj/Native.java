@@ -107,9 +107,9 @@ public final class Native {
      */
     public static native long recycleSpin(int fd, int cpu, int ms);
 
-    /** Write a, spin delayUs microseconds, then write b, all on this thread. */
+    /** Write a, spin delayNs nanoseconds, then write b, all on this thread. */
     public static native int duoDelay(int fd, byte[] a, int aLen,
-                                      byte[] b, int bLen, int delayUs);
+                                      byte[] b, int bLen, int delayNs);
 
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
