@@ -679,6 +679,37 @@ Java_com_inj_Native_acceptFd(JNIEnv *env, jclass cls, jint fd)
     return conn;
 }
 
+// Accept and immediately close children, with nothing in between.
+//
+// The only thing that ever frees the options object is inet_sock_destruct()
+// running for the child, and the only trigger we control is closing that
+// child. Everything this loop does after accept() therefore sits directly on
+// top of the race: the kernel builds a SYNACK for a retransmitted SYN while we
+// are closing the socket that owns the same ip_options_rcu. Reading the
+// options, formatting a string and handing the fd to the ring all added
+// microseconds of jitter to that moment, which is far more than the window the
+// kernel leaves open, so they are gone from this path.
+JNIEXPORT jlong JNICALL
+Java_com_inj_Native_acceptClose(JNIEnv *env, jclass cls, jint fd, jint count)
+{
+    long done = 0;
+    int i;
+    (void)env;
+    (void)cls;
+
+    for (i = 0; i < count; i++) {
+        int conn = accept(fd, NULL, NULL);
+        if (conn < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        close(conn);
+        done++;
+    }
+    return done;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
