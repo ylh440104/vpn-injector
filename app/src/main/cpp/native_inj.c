@@ -1048,6 +1048,98 @@ Java_com_inj_Native_dupProbe(JNIEnv *env, jclass cls, jint count, jint tag)
     free(fds);
     return found;
 }
+// Fire two packets from two cpus at the same instant.
+//
+// Two java threads spinning on a volatile field release each other hundreds of
+// microseconds apart - measured, not guessed - and the window where both can be
+// inside tcp_check_req for the same request socket is only a few microseconds.
+// So the rendezvous has to happen below the jvm: both writers park on one
+// atomic word here, the caller flips it once, and they leave within a hundred
+// nanoseconds of each other, each on its own cpu.
+typedef struct {
+    int fd;
+    const unsigned char *pkt;
+    int len;
+    int cpu;
+    volatile int *go;
+} duo_arg;
+
+static void *duo_worker(void *arg)
+{
+    duo_arg *a = (duo_arg *) arg;
+    unsigned long mask = 1UL << a->cpu;
+    int spin;
+
+    syscall(__NR_sched_setaffinity, 0, sizeof mask, &mask);
+
+    /* Park until the caller releases both writers. */
+    for (spin = 0; !*a->go && spin < 200000000; spin++) {
+        __sync_synchronize();
+    }
+    write(a->fd, a->pkt, (size_t) a->len);
+    return NULL;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_dualWrite(JNIEnv *env, jclass cls, jint fd,
+                              jbyteArray a, jint aLen,
+                              jbyteArray b, jint bLen, jint cpuA, jint cpuB)
+{
+    pthread_t t1, t2;
+    duo_arg arg1, arg2;
+    volatile int go = 0;
+    jbyte *pa, *pb;
+    (void)env;
+    (void)cls;
+
+    if (aLen <= 0 || aLen > 4096 || bLen <= 0 || bLen > 4096) {
+        return -1;
+    }
+    pa = (*env)->GetByteArrayElements(env, a, NULL);
+    pb = (*env)->GetByteArrayElements(env, b, NULL);
+    if (pa == NULL || pb == NULL) {
+        if (pa) (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        if (pb) (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -2;
+    }
+
+    arg1.fd = fd;
+    arg1.pkt = (const unsigned char *) pa;
+    arg1.len = aLen;
+    arg1.cpu = cpuA;
+    arg1.go = &go;
+
+    arg2.fd = fd;
+    arg2.pkt = (const unsigned char *) pb;
+    arg2.len = bLen;
+    arg2.cpu = cpuB;
+    arg2.go = &go;
+
+    if (pthread_create(&t1, NULL, duo_worker, &arg1) != 0) {
+        (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -3;
+    }
+    if (pthread_create(&t2, NULL, duo_worker, &arg2) != 0) {
+        go = 1;
+        pthread_join(t1, NULL);
+        (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+        (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+        return -4;
+    }
+
+    /* Give both writers time to pin and reach the spin, then release together. */
+    usleep(120);
+    __sync_synchronize();
+    go = 1;
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    (*env)->ReleaseByteArrayElements(env, a, pa, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, b, pb, JNI_ABORT);
+    return 0;
+}
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
