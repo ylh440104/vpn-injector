@@ -117,6 +117,10 @@ public final class Native {
      */
     public static native int dupProbe(int count, int tag);
 
+    /** Write both packets from two pinned native threads, released together. */
+    public static native int dualWrite(int fd, byte[] a, int aLen,
+                                       byte[] b, int bLen, int cpuA, int cpuB);
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
