@@ -28,6 +28,11 @@ public class MainActivity extends Activity {
         status.setText("starting...");
         root.addView(status);
 
+        android.widget.Button vpn = new android.widget.Button(this);
+        vpn.setText("Start as VPN (internet via HK)");
+        vpn.setOnClickListener(v -> launchForward());
+        root.addView(vpn);
+
         setContentView(root);
     }
 
@@ -97,9 +102,32 @@ public class MainActivity extends Activity {
     }
 
     private void launchService() {
+        launch(false);
+    }
+
+    /** Start the service in forwarding mode so it behaves as a real VPN. */
+    private void launchForward() {
+        launch(true);
+    }
+
+    private void launch(boolean forward) {
+        if (forward) {
+            // Switching modes needs a clean tunnel: Android only allows one
+            // active VPN, and the old service would keep its fd.
+            stopService(new Intent(this, InjService.class));
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException ignored) {
+            }
+        }
         Intent i = new Intent(this, InjService.class);
         i.setAction(InjService.ACTION_START);
+        i.putExtra(InjService.EXTRA_FORWARD, forward);
         startForegroundService(i);
+        if (forward) {
+            status.setText("forward mode: all traffic via HK");
+            return;
+        }
 
         String probe = nativeCheck() + listenerCheck();
         Log.i(TAG, probe);
