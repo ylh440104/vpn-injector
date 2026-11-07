@@ -292,14 +292,41 @@ public class MiniVpn extends VpnService implements Runnable {
      */
     private void sprayLoop(int sport) {
         byte[] pkt = buildRst(sport);
+
+        /* Latency stats for one write(), so the jitter is measured, not guessed. */
+        long n = 0;
+        long sum = 0;
+        long min = Long.MAX_VALUE;
+        long max = 0;
+
         while (running) {
             for (int k = 0; k < BURST; k++) {
+                long t0 = System.nanoTime();
                 try {
                     fos.write(pkt);
                 } catch (Throwable t) {
                     errCount.incrementAndGet();
                     break;
                 }
+                long d = System.nanoTime() - t0;
+                sum += d;
+                n++;
+                if (d < min) {
+                    min = d;
+                }
+                if (d > max) {
+                    max = d;
+                }
+            }
+            if (n >= 2000) {
+                Log.i(TAG, "write us: min=" + (min / 1000)
+                        + " avg=" + (sum / n / 1000)
+                        + " max=" + (max / 1000)
+                        + " n=" + n);
+                n = 0;
+                sum = 0;
+                min = Long.MAX_VALUE;
+                max = 0;
             }
             Thread.yield();
         }
