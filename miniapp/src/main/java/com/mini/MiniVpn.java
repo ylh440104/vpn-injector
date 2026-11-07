@@ -180,7 +180,9 @@ public class MiniVpn extends VpnService implements Runnable {
 
         int pos = 0;
         int counter = 0;
+        int iter = 0;
         while (running) {
+            iter++;
             Socket s = null;
             ParcelFileDescriptor p = null;
             try {
@@ -197,12 +199,14 @@ public class MiniVpn extends VpnService implements Runnable {
                 p = ParcelFileDescriptor.fromSocket(s);
                 if (p == null) {
                     closeQuiet(s);
-                    churnErr.incrementAndGet();
+                    if (churnErr.incrementAndGet() <= 3) {
+                        Log.w(TAG, "fromSocket returned null (hidden API?)");
+                    }
                     continue;
                 }
                 FileDescriptor fd = p.getFileDescriptor();
                 byte[] opt = makeOpt(counter);
-                if (!setsockoptBytes(os, fd, opt)) {
+                if (!setsockoptBytes(os, fd, opt, counter <= 3)) {
                     closeQuiet(p);
                     closeQuiet(s);
                     churnErr.incrementAndGet();
@@ -242,11 +246,15 @@ public class MiniVpn extends VpnService implements Runnable {
                 pos = (pos + 1) % RING;
                 counter++;
 
-                if ((counter % 2000) == 0) {
-                    Log.i(TAG, "churn=" + counter + " overlap=" + overlap.get()
+                if ((counter % 2000) == 0 && counter > 0) {
+                    Log.i(TAG, "churn=" + counter + " iter=" + iter
+                            + " overlap=" + overlap.get()
                             + " churnErr=" + churnErr.get());
                 }
             } catch (Throwable t) {
+                if (churnErr.incrementAndGet() <= 3) {
+                    Log.w(TAG, "churn iteration failed", t);
+                }
                 closeQuiet(p);
                 closeQuiet(s);
             }
@@ -285,13 +293,16 @@ public class MiniVpn extends VpnService implements Runnable {
         return libcoreOsCache;
     }
 
-    static boolean setsockoptBytes(Object os, FileDescriptor fd, byte[] data) {
+    static boolean setsockoptBytes(Object os, FileDescriptor fd, byte[] data, boolean logFail) {
         try {
             Method m = os.getClass().getMethod("setsockoptBytes",
                     FileDescriptor.class, int.class, int.class, byte[].class);
             m.invoke(os, fd, 0 /* IPPROTO_IP */, 4 /* IP_OPTIONS */, data);
             return true;
         } catch (Throwable t) {
+            if (logFail) {
+                Log.w(TAG, "setsockoptBytes failed", t);
+            }
             return false;
         }
     }
