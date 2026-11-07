@@ -80,6 +80,8 @@ public class MiniVpn extends VpnService implements Runnable {
     static final AtomicLong rstCount = new AtomicLong();
     static final AtomicLong errCount = new AtomicLong();
     static final AtomicLong bindFail = new AtomicLong();
+    /** Churn-specific failures, kept separate from tun write errors. */
+    static final AtomicLong churnErr = new AtomicLong();
     /** How many churn slots were found holding somebody else's marker. */
     static final AtomicLong overlap = new AtomicLong();
     /** Slots kept alive by the kmalloc-96 churn detector. */
@@ -195,7 +197,7 @@ public class MiniVpn extends VpnService implements Runnable {
                 p = ParcelFileDescriptor.fromSocket(s);
                 if (p == null) {
                     closeQuiet(s);
-                    errCount.incrementAndGet();
+                    churnErr.incrementAndGet();
                     continue;
                 }
                 FileDescriptor fd = p.getFileDescriptor();
@@ -203,7 +205,7 @@ public class MiniVpn extends VpnService implements Runnable {
                 if (!setsockoptBytes(os, fd, opt)) {
                     closeQuiet(p);
                     closeQuiet(s);
-                    errCount.incrementAndGet();
+                    churnErr.incrementAndGet();
                     continue;
                 }
 
@@ -242,7 +244,7 @@ public class MiniVpn extends VpnService implements Runnable {
 
                 if ((counter % 2000) == 0) {
                     Log.i(TAG, "churn=" + counter + " overlap=" + overlap.get()
-                            + " err=" + errCount.get());
+                            + " churnErr=" + churnErr.get());
                 }
             } catch (Throwable t) {
                 closeQuiet(p);
