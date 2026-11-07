@@ -2,7 +2,10 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 
 /*
@@ -146,6 +149,129 @@ Java_com_mini_MiniVpn_nativeCompare(JNIEnv *env, jclass clazz, jint fd,
 
     (*env)->ReleaseByteArrayElements(env, baseline, b, JNI_ABORT);
     return r;
+}
+
+/*
+ * Widen the syn_recv_sock() window.
+ *
+ * tcp_v4_syn_recv_sock() calls inet_csk_route_req() to find a route for the
+ * new child. When the SYN carried an LSRR option, that lookup is done against
+ * opt->faddr instead of the peer address. If faddr has never been routed
+ * before, ip_route_output_slow() walks the FIB instead of hitting the dst
+ * cache, which costs tens of microseconds instead of a couple.
+ *
+ * That does not make the timing jitter go away, it makes the target fifty
+ * times bigger -- which is the only lever that actually helps here.
+ *
+ * Client side: build the LSRR option, bind to the tun address, kick off a
+ * non-blocking connect. Returns the fd, or -errno.
+ */
+JNIEXPORT jint JNICALL
+Java_com_mini_MiniVpn_nativeConnectLsrc(JNIEnv *env, jclass clazz,
+                                        jint sport, jint lsrc, jint dport)
+{
+    int fd;
+    int r;
+    int e;
+    struct sockaddr_in sa;
+    unsigned char opt[OPT_LEN];
+    int i;
+
+    (void) env;
+    (void) clazz;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    /*
+     * NOP + LSRR(39). Nine addresses follow the pointer field; the kernel only
+     * routes against the first one (faddr), but a full list keeps the option
+     * block at 40 bytes so the request sock's ireq_opt still lands in
+     * kmalloc-96.
+     */
+    memset(opt, 0, OPT_LEN);
+    opt[0] = 1;     /* IPOPT_NOP  */
+    opt[1] = 131;   /* IPOPT_LSRR */
+    opt[2] = 39;    /* length     */
+    opt[3] = 4;     /* pointer    */
+    for (i = 0; i < 9; i++) {
+        unsigned int a = (unsigned int) lsrc + (unsigned int) i;
+        opt[4 + i * 4 + 0] = (unsigned char) ((a >> 24) & 0xff);
+        opt[4 + i * 4 + 1] = (unsigned char) ((a >> 16) & 0xff);
+        opt[4 + i * 4 + 2] = (unsigned char) ((a >> 8) & 0xff);
+        opt[4 + i * 4 + 3] = (unsigned char) (a & 0xff);
+    }
+    if (setsockopt(fd, IPPROTO_IP, IP_OPTIONS, opt, sizeof(opt)) != 0) {
+        e = errno;
+        close(fd);
+        return -e;
+    }
+
+    /* Bind to the tun address so the peer sees a local source. */
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short) sport);
+    sa.sin_addr.s_addr = htonl(0x0A070701u); /* 10.7.7.1 */
+    if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+        e = errno;
+        close(fd);
+        return -e;
+    }
+
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short) dport);
+    sa.sin_addr.s_addr = htonl(0x0A070701u);
+
+    r = connect(fd, (struct sockaddr *) &sa, sizeof(sa));
+    if (r == 0) {
+        return fd;
+    }
+    if (errno == EINPROGRESS || errno == EALREADY) {
+        return fd;
+    }
+    e = errno;
+    close(fd);
+    return -e;
+}
+
+/*
+ * Poll a non-blocking connect.
+ * 1 = established, 0 = still pending, negative = failed with that errno.
+ */
+JNIEXPORT jint JNICALL
+Java_com_mini_MiniVpn_nativePollConnect(JNIEnv *env, jclass clazz, jint fd,
+                                        jint micros)
+{
+    fd_set wfds;
+    struct timeval tv;
+    int r;
+    int err = 0;
+    socklen_t elen = sizeof(err);
+
+    (void) env;
+    (void) clazz;
+
+    FD_ZERO(&wfds);
+    FD_SET((int) fd, &wfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = (micros > 0) ? (long) micros : 0L;
+
+    r = select((int) fd + 1, NULL, &wfds, NULL, &tv);
+    if (r <= 0) {
+        return 0;
+    }
+    if (getsockopt((int) fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0) {
+        return -errno;
+    }
+    if (err == 0) {
+        return 1;
+    }
+    return -err;
 }
 
 JNIEXPORT void JNICALL
