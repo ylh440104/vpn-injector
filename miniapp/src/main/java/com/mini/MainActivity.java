@@ -28,6 +28,7 @@ public class MainActivity extends Activity {
             long ok = MiniVpn.okCount.get();
             long rst = MiniVpn.rstCount.get();
             long err = MiniVpn.errCount.get();
+            long ovl = MiniVpn.overlap.get();
             long total = ok + rst;
             long pct = total == 0 ? 0 : (rst * 100 / total);
 
@@ -36,7 +37,8 @@ public class MainActivity extends Activity {
                     + "\nconnect ok  : " + ok
                     + "\nconnect rst : " + rst
                     + "\ntun write err: " + err
-                    + "\nreset ratio : " + pct + "%");
+                    + "\nreset ratio : " + pct + "%"
+                    + "\nKMALLOC96 OVERLAP : " + ovl);
             handler.postDelayed(this, 500);
         }
     };
