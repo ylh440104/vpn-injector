@@ -206,6 +206,18 @@ Java_com_mini_MiniVpn_nativeConnectRr(JNIEnv *env, jclass clazz,
         return -errno;
     }
 
+    /*
+     * RST on close. Without this the pinned source port lands in TIME_WAIT for
+     * a full minute and every subsequent bind() fails with EADDRINUSE (98),
+     * which is exactly what happened before this was added.
+     */
+    {
+        struct linger lg;
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
+
     /* NOP + RR(39): optlen 40, so ip_options_rcu lands in kmalloc-96. */
     memset(opt, 0, OPT_LEN);
     opt[0] = 1;     /* IPOPT_NOP */
