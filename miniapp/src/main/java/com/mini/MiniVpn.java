@@ -164,7 +164,7 @@ public class MiniVpn extends VpnService implements Runnable {
      */
     private void churnLoop() {
         int[] fds = new int[RING];
-        int[] marks = new int[RING];
+        byte[][] base = new byte[RING][];
         for (int k = 0; k < RING; k++) {
             fds[k] = -1;
         }
@@ -172,8 +172,7 @@ public class MiniVpn extends VpnService implements Runnable {
         int pos = 0;
         int counter = 0;
         while (running) {
-            int mark = counter;
-            int fd = nativeChurn(mark);
+            int fd = nativeChurn(counter);
             if (fd < 0) {
                 churnErr.incrementAndGet();
                 if (churnErr.get() <= 3) {
@@ -183,29 +182,38 @@ public class MiniVpn extends VpnService implements Runnable {
             }
 
             /*
-             * Self-test once: if the kernel normalised the option block on the
-             * way in, every later comparison would be a false positive.
+             * Capture what the kernel actually stored, not what we wrote.
+             * ip_options_compile rewrites parts of the block, so comparing
+             * against a freshly rebuilt expectation gives a 100% false
+             * positive rate.
              */
+            byte[] snap = new byte[64];
+            int n = nativeDump(fd, snap);
+            if (n <= 0) {
+                churnErr.incrementAndGet();
+                nativeClose(fd);
+                continue;
+            }
+            byte[] mine = new byte[n];
+            System.arraycopy(snap, 0, mine, 0, n);
+
             if (counter == 0) {
-                byte[] back = new byte[64];
-                int n = nativeDump(fd, back);
-                Log.i(TAG, "selftest mark=0 dump=" + hex(back, n));
+                Log.i(TAG, "selftest dump=" + hex(mine, mine.length));
             }
 
-            /* Is the slot we are about to evict still carrying its own mark? */
-            if (fds[pos] >= 0) {
-                int v = nativeVerify(fds[pos], marks[pos]);
+            /* Is the slot we are about to evict still holding its baseline? */
+            if (fds[pos] >= 0 && base[pos] != null) {
+                int v = nativeCompare(fds[pos], base[pos]);
                 if (v == 0) {
                     overlap.incrementAndGet();
                     Log.w(TAG, "OVERLAP slot=" + pos
-                            + " mark=" + marks[pos]
                             + " total=" + overlap.get());
                 }
                 nativeClose(fds[pos]);
             }
 
             fds[pos] = fd;
-            marks[pos] = mark;
+            base[pos] = mine;
             pos = (pos + 1) % RING;
             counter++;
 
@@ -233,8 +241,8 @@ public class MiniVpn extends VpnService implements Runnable {
     /** Create a socket with a marked IP_OPTIONS block. Returns fd or -errno. */
     static native int nativeChurn(int mark);
 
-    /** 1 = block still matches mark, 0 = somebody else owns it, -1 = error. */
-    static native int nativeVerify(int fd, int mark);
+    /** 1 = block still matches baseline, 0 = changed, -1 = error. */
+    static native int nativeCompare(int fd, byte[] baseline);
 
     /** Copy the raw option block into out; returns byte count or -errno. */
     static native int nativeDump(int fd, byte[] out);
