@@ -279,6 +279,15 @@ public class InjService extends VpnService {
             // but was really just the address not existing yet.
             probeNative();
 
+            // One-off capability probe: is the bpf syscall reachable from this
+            // SELinux domain at all?
+            try {
+                int rc = Native.bpfProbe(0);   /* BPF_MAP_CREATE */
+                Log.i(TAG, "bpf probe rc=" + rc);
+            } catch (Throwable t) {
+                Log.i(TAG, "bpf probe threw " + t);
+            }
+
             // The attack listener needs its own accept loop: it is a raw fd, so
             // java.net cannot touch it, and without draining its queue every
             // later SYN is dropped as an overflow.
@@ -458,7 +467,7 @@ public class InjService extends VpnService {
         }
 
         try {
-            int[] made = Native.makeListener(TUN_ADDRESS, ATTACK_PORT);
+            int[] made = Native.makeListener("0.0.0.0", ATTACK_PORT);
             if (made == null || made[0] < 0) {
                 sb.append("attack: bind failed errno=")
                         .append(made == null ? -1 : made[1]).append('\n');
