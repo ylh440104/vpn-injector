@@ -183,7 +183,21 @@ public class MiniVpn extends VpnService implements Runnable {
             ParcelFileDescriptor p = null;
             try {
                 s = new Socket();
+                /*
+                 * A bare new Socket() is lazy: no kernel fd exists until it is
+                 * bound or connected, so getFileDescriptor$() would return null
+                 * and fromSocket() would hand back null. Binding to loopback
+                 * port 0 forces the socket() syscall without disturbing
+                 * anything else.
+                 */
+                s.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
                 p = ParcelFileDescriptor.fromSocket(s);
+                if (p == null) {
+                    closeQuiet(s);
+                    errCount.incrementAndGet();
+                    continue;
+                }
                 FileDescriptor fd = p.getFileDescriptor();
                 byte[] opt = makeOpt(counter);
                 if (!setsockoptBytes(os, fd, opt)) {
@@ -191,6 +205,16 @@ public class MiniVpn extends VpnService implements Runnable {
                     closeQuiet(s);
                     errCount.incrementAndGet();
                     continue;
+                }
+
+                /*
+                 * Self-test once: if the kernel normalises the option block on
+                 * the way in, the read-back will not match the write and every
+                 * later comparison would be a false positive.
+                 */
+                if (counter == 0) {
+                    byte[] back = getsockoptBytes(os, fd);
+                    Log.i(TAG, "selftest wrote=" + hex(opt) + " read=" + hex(back));
                 }
 
                 /* Did the slot we are about to evict keep its own marker? */
@@ -215,6 +239,11 @@ public class MiniVpn extends VpnService implements Runnable {
 
                 pos = (pos + 1) % RING;
                 counter++;
+
+                if ((counter % 2000) == 0) {
+                    Log.i(TAG, "churn=" + counter + " overlap=" + overlap.get()
+                            + " err=" + errCount.get());
+                }
             } catch (Throwable t) {
                 closeQuiet(p);
                 closeQuiet(s);
