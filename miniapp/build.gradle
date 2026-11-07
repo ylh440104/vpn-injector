@@ -9,7 +9,13 @@ android {
     defaultConfig {
         applicationId 'com.mini'
         minSdk 24
-        targetSdk 34
+        /*
+         * 27 on purpose: ParcelFileDescriptor.fromSocket() goes through
+         * Socket.getFileDescriptor$(), which is a hidden API. At targetSdk 28+
+         * the non-SDK restrictions hand back null and the churn detector can
+         * never obtain a file descriptor.
+         */
+        targetSdk 27
         versionCode 1
         versionName '1.0'
     }
