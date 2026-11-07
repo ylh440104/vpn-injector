@@ -67,36 +67,6 @@ Java_com_mini_MiniVpn_nativeChurn(JNIEnv *env, jclass clazz, jint mark)
 }
 
 /*
- * Read the option block back and compare it with what was written.
- * Returns 1 on match, 0 on mismatch (i.e. somebody else owns the memory now),
- * and -1 if getsockopt itself failed.
- */
-JNIEXPORT jint JNICALL
-Java_com_mini_MiniVpn_nativeVerify(JNIEnv *env, jclass clazz, jint fd, jint mark)
-{
-    unsigned char cur[64];
-    unsigned char want[OPT_LEN];
-    socklen_t len = sizeof(cur);
-
-    (void) env;
-    (void) clazz;
-
-    memset(cur, 0, sizeof(cur));
-    if (getsockopt((int) fd, IPPROTO_IP, IP_OPTIONS, cur, &len) != 0) {
-        return -1;
-    }
-
-    fill_opt(want, (int) mark);
-    if ((size_t) len != sizeof(want)) {
-        return 0;
-    }
-    if (memcmp(cur, want, sizeof(want)) != 0) {
-        return 0;
-    }
-    return 1;
-}
-
-/*
  * Dump the raw option block of a socket so the self-test can show what the
  * kernel actually stored. Writes at most cap bytes, returns the byte count
  * or a negative errno.
@@ -129,6 +99,53 @@ Java_com_mini_MiniVpn_nativeDump(JNIEnv *env, jclass clazz, jint fd,
         (*env)->SetByteArrayRegion(env, out, 0, n, (const jbyte *) cur);
     }
     return (jint) n;
+}
+
+/*
+ * Compare the socket's current option block against a previously captured
+ * baseline. Using the captured read-back as the reference (rather than
+ * rebuilding the expected block from the marker) sidesteps any normalisation
+ * the kernel applies on the way in, which otherwise produced a 100% false
+ * positive rate.
+ *
+ * Returns 1 if identical, 0 if it changed (i.e. somebody else owns this
+ * memory now), -1 on error.
+ */
+JNIEXPORT jint JNICALL
+Java_com_mini_MiniVpn_nativeCompare(JNIEnv *env, jclass clazz, jint fd,
+                                    jbyteArray baseline)
+{
+    unsigned char cur[64];
+    socklen_t len = sizeof(cur);
+    jsize blen;
+    jbyte *b;
+    int r;
+
+    (void) clazz;
+
+    if (baseline == NULL) {
+        return -EINVAL;
+    }
+    blen = (*env)->GetArrayLength(env, baseline);
+    b = (*env)->GetByteArrayElements(env, baseline, NULL);
+    if (b == NULL) {
+        return -ENOMEM;
+    }
+
+    memset(cur, 0, sizeof(cur));
+    if (getsockopt((int) fd, IPPROTO_IP, IP_OPTIONS, cur, &len) != 0) {
+        (*env)->ReleaseByteArrayElements(env, baseline, b, JNI_ABORT);
+        return -errno;
+    }
+
+    if ((jsize) len != blen) {
+        r = 0;
+    } else {
+        r = (memcmp(cur, b, (size_t) blen) == 0) ? 1 : 0;
+    }
+
+    (*env)->ReleaseByteArrayElements(env, baseline, b, JNI_ABORT);
+    return r;
 }
 
 JNIEXPORT void JNICALL
