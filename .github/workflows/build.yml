@@ -49,6 +49,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: inj-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: all-debug-apks
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            miniapp/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
