@@ -130,6 +130,9 @@ public final class Native {
     /** Release every armed resident writer at the same instant. */
     public static native int duoFire();
 
+    /** 0 if bpf(BPF_MAP_CREATE) is reachable, else -errno. */
+    public static native int bpfProbe(int cmd);
+
     /**
      * Read IP_OPTIONS from a socket, as "len=N head=<hex>" or "none errno=N".
      *
