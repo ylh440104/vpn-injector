@@ -1323,6 +1323,41 @@ Java_com_inj_Native_duoFire(JNIEnv *env, jclass cls)
     }
     return armed;
 }
+// Can an untrusted app even reach the bpf syscall here?
+//
+// Before spending any time on a verifier bug, this has to be answered: Android
+// SELinux usually denies bpf to untrusted_app outright, and unprivileged_bpf
+// being0 only says the kernel would allow it, not that the policy does.
+// Returns0 on success, or -errno so EPERM/EACCES/SECCOMP are distinguishable.
+JNIEXPORT jint JNICALL
+Java_com_inj_Native_bpfProbe(JNIEnv *env, jclass cls, jint cmd)
+{
+    struct { /* minimal bpf_attr for MAP_CREATE */
+        unsigned int map_type;
+        unsigned int key_size;
+        unsigned int value_size;
+        unsigned int max_entries;
+        unsigned int map_flags;
+    } attr;
+    int fd;
+    (void)env;
+    (void)cls;
+
+    memset(&attr, 0, sizeof attr);
+    attr.map_type = 2;      /* BPF_MAP_TYPE_ARRAY */
+    attr.key_size = 4;
+    attr.value_size = 8;
+    attr.max_entries = 1;
+
+    /* __NR_bpf is280 on arm64 */
+    fd = (int) syscall(280, cmd, &attr, sizeof attr);
+    if (fd < 0) {
+        return -errno;
+    }
+    close(fd);
+    return 0;
+}
+
 // Read IP_OPTIONS from a socket and report what came back.
 //
 // If the request-socket race fired, the winning child inherited an
