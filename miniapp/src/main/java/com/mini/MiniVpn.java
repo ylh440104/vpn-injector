@@ -51,21 +51,24 @@ public class MiniVpn extends VpnService implements Runnable {
     static final String IP = "10.7.7.1";
     /** Listener port. */
     static final int PORT = 47777;
-    /** Client source ports are SPORT_BASE + (0 .. SPORT_RANGE-1). */
-    static final int SPORT_BASE = 20000;
-    static final int SPORT_RANGE = 20000;
-    /** Prime stride so consecutive rounds do not reuse a port too soon. */
-    static final int SPORT_STRIDE = 997;
-    /** RSTs written per round. */
-    static final int BURST = 96;
+    /** RSTs written per batch by the spray thread. */
+    static final int BURST = 32;
     /** Poll budget for finishConnect(), in iterations. */
     static final int FINISH_POLLS = 400;
+    /**
+     * The spray pins one source port so that a continuous RST stream covers
+     * the whole connect() interval. A per-round burst cannot do that: by the
+     * time connect() returns, local delivery has already walked SYN, SYNACK
+     * and ACK inside the same syscall and the request sock is gone.
+     */
+    static final int PINNED_SPORT = 39999;
 
     static volatile String status = "idle";
     static final AtomicLong rounds = new AtomicLong();
     static final AtomicLong okCount = new AtomicLong();
     static final AtomicLong rstCount = new AtomicLong();
     static final AtomicLong errCount = new AtomicLong();
+    static final AtomicLong bindFail = new AtomicLong();
 
     private ParcelFileDescriptor pfd;
     private FileOutputStream fos;
@@ -102,7 +105,41 @@ public class MiniVpn extends VpnService implements Runnable {
     public void run() {
         startListener();
         sleepQuiet(300);
+
+        Thread spray = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                sprayLoop();
+            }
+        }, "spray");
+        spray.start();
+
         clientLoop();
+    }
+
+    /**
+     * Continuous RST stream on the pinned source port. It runs for the whole
+     * session, so some RST is always in flight while connect() is walking the
+     * handshake, instead of arriving only after the fact.
+     *
+     * The batch is deliberately small and followed by a yield: writing flat out
+     * overflows netdev_max_backlog (default 1000), and those drops do not show
+     * up in any IP counter, which is what made the earlier runs look like the
+     * RSTs were being ignored by the socket layer.
+     */
+    private void sprayLoop() {
+        byte[] pkt = buildRst(PINNED_SPORT);
+        while (running) {
+            for (int k = 0; k < BURST; k++) {
+                try {
+                    fos.write(pkt);
+                } catch (Throwable t) {
+                    errCount.incrementAndGet();
+                    break;
+                }
+            }
+            Thread.yield();
+        }
     }
 
     private void startListener() {
@@ -136,35 +173,32 @@ public class MiniVpn extends VpnService implements Runnable {
             return;
         }
         final InetSocketAddress target = new InetSocketAddress(local, PORT);
+        final InetSocketAddress source = new InetSocketAddress(local, PINNED_SPORT);
 
         int i = 0;
         while (running) {
             i++;
-            int sport = SPORT_BASE + ((i * SPORT_STRIDE) % SPORT_RANGE);
 
             SocketChannel ch = null;
             try {
                 ch = SocketChannel.open();
                 ch.configureBlocking(false);
                 ch.socket().setReuseAddress(true);
-                ch.socket().bind(new InetSocketAddress(local, sport));
-
                 /*
-                 * Non-blocking: the SYN is emitted, control comes straight
-                 * back, and the RST stream starts on this very thread.
+                 * RST on close: keeps the pinned source port out of TIME_WAIT
+                 * so it can be reused on the very next round.
                  */
+                ch.socket().setSoLinger(true, 0);
+                ch.socket().bind(source);
+            } catch (Throwable t) {
+                bindFail.incrementAndGet();
+                closeQuiet(ch);
+                rounds.incrementAndGet();
+                continue;
+            }
+
+            try {
                 ch.connect(target);
-
-                byte[] pkt = buildRst(sport);
-                for (int k = 0; k < BURST; k++) {
-                    try {
-                        fos.write(pkt);
-                    } catch (Throwable t) {
-                        errCount.incrementAndGet();
-                        break;
-                    }
-                }
-
                 if (awaitConnect(ch)) {
                     okCount.incrementAndGet();
                 } else {
@@ -181,6 +215,7 @@ public class MiniVpn extends VpnService implements Runnable {
                 Log.i(TAG, "rounds=" + rounds.get()
                         + " ok=" + okCount.get()
                         + " rst=" + rstCount.get()
+                        + " bindFail=" + bindFail.get()
                         + " err=" + errCount.get());
             }
         }
