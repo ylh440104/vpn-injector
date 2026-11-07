@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = 'vpn-injector'
 include ':app'
+include ':miniapp'
